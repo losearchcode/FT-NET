@@ -6,6 +6,10 @@ import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
+
+// 注入读取外部宏定义环境表配置 (.env)
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -43,7 +47,8 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-const port = 31208; // 使用全新的避让端口，免受 Vite 测试残留端口的占用影响
+// 从环境宏定义文件中抽取指定的端口号，若未定义或异常则平滑降级 fallback 到兜底的 31208
+const port = process.env.PORT || 31208;
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
