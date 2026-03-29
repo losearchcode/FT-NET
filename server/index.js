@@ -45,12 +45,26 @@ const storage = multer.diskStorage({
         cb(null, uniquePrefix + '-' + utf8Name);
     }
 });
-const upload = multer({ storage });
+const upload = multer({ 
+    storage,
+    limits: { fileSize: 10 * 1024 * 1024 * 1024 } // 10GB 上限
+});
 
 // 从环境宏定义文件中抽取指定的端口号，若未定义或异常则平滑降级 fallback 到兜底的 31208
 const port = process.env.PORT || 31208;
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+
+// 【关键修复】彻底移除 Node.js http 服务器的默认超时限制
+// 这是大文件传输被中途静默截断的根因！
+server.timeout = 0;           // 读写总超时 → 无限
+server.headersTimeout = 0;    // 请求头等待超时 → 无限
+server.requestTimeout = 0;    // 整个请求超时 → 无限
+server.keepAliveTimeout = 0;  // 保活超时 → 无限
+
+const io = new Server(server, { 
+    cors: { origin: '*' },
+    maxHttpBufferSize: 1e8 // Socket.io 单消息包体上限 100MB
+});
 
 // In-Memory Database: rooms.get(roomId) -> { messages: [], files: [], users: Set }
 const rooms = new Map();

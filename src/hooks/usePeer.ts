@@ -100,36 +100,58 @@ export const usePeer = () => {
         formData.append('file', file);
         formData.append('senderId', peerId);
 
-        try {
-            const xhr = new XMLHttpRequest();
-            const uploadUrl = `/upload/${roomPassword}`;
-            xhr.open('POST', uploadUrl, true);
+        const MAX_RETRIES = 3;
+        let attempt = 0;
 
-            xhr.upload.onprogress = (event) => {
-                if (event.lengthComputable) {
-                    const percentComplete = (event.loaded / event.total);
-                    setUploadProgress({ progress: percentComplete, active: true });
-                }
-            };
+        const doUpload = (): Promise<void> => {
+            return new Promise((resolve, reject) => {
+                attempt++;
+                const xhr = new XMLHttpRequest();
+                const uploadUrl = `/upload/${roomPassword}`;
+                xhr.open('POST', uploadUrl, true);
 
-            xhr.onload = () => {
-                if (xhr.status === 200) {
-                    setUploadProgress({ progress: 1, active: false });
-                } else {
-                    console.error('File Upload rejected:', xhr.responseText);
+                // 【关键】彻底禁用浏览器端的 XHR 超时限制，防止大文件传输中途被强切
+                xhr.timeout = 0;
+
+                xhr.upload.onprogress = (event) => {
+                    if (event.lengthComputable) {
+                        const percentComplete = (event.loaded / event.total);
+                        setUploadProgress({ progress: percentComplete, active: true });
+                    }
+                };
+
+                xhr.onload = () => {
+                    if (xhr.status === 200) {
+                        setUploadProgress({ progress: 1, active: false });
+                        resolve();
+                    } else {
+                        reject(new Error(`Server rejected: ${xhr.status} ${xhr.responseText}`));
+                    }
+                };
+
+                xhr.onerror = () => reject(new Error('Network error'));
+                xhr.ontimeout = () => reject(new Error('Request timed out'));
+                xhr.onabort = () => reject(new Error('Upload aborted'));
+
+                xhr.send(formData);
+            });
+        };
+
+        while (attempt < MAX_RETRIES) {
+            try {
+                await doUpload();
+                return; // 成功则直接退出
+            } catch (error: any) {
+                console.warn(`Upload attempt ${attempt}/${MAX_RETRIES} failed:`, error?.message);
+                if (attempt >= MAX_RETRIES) {
+                    console.error('Upload permanently failed after max retries.');
                     setUploadProgress({ progress: 0, active: false });
+                    return;
                 }
-            };
-
-            xhr.onerror = () => {
-                console.error('Upload Error: network failure');
-                setUploadProgress({ progress: 0, active: false });
-            };
-
-            xhr.send(formData);
-        } catch (error) {
-            console.error('Upload Process Failed:', error);
-            setUploadProgress({ progress: 0, active: false });
+                // 重试前短暂等待
+                setUploadProgress(prev => ({ ...prev, active: true }));
+                await new Promise(r => setTimeout(r, 1500));
+            }
         }
     };
 
