@@ -14,6 +14,10 @@
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
+<p align="center">
+  <img src="Doc/Images/FT-NET.png" alt="FT-NET 效果图" width="800" />
+</p>
+
 ---
 
 ## ✨ 产品亮点
