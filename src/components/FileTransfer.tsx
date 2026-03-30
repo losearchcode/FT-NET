@@ -15,13 +15,19 @@ export const FileTransfer = ({ roomId, files, uploadProgress, onUpload, onDelete
 
     const handleDrop = useCallback((e: any) => {
         e.preventDefault();
-        const file = e.dataTransfer.files[0];
-        if (file) onUpload(file);
+        const droppedFiles = e.dataTransfer.files;
+        for (let i = 0; i < droppedFiles.length; i++) {
+            onUpload(droppedFiles[i]);
+        }
     }, [onUpload]);
 
     const handleFileInput = (e: any) => {
-        const file = e.target.files?.[0];
-        if (file) onUpload(file);
+        const selectedFiles = e.target.files;
+        if (selectedFiles) {
+            for (let i = 0; i < selectedFiles.length; i++) {
+                onUpload(selectedFiles[i]);
+            }
+        }
     };
 
     const downloadFile = (file: FileMetadata) => {
@@ -92,6 +98,7 @@ export const FileTransfer = ({ roomId, files, uploadProgress, onUpload, onDelete
                 <input
                     type="file"
                     id="file-upload"
+                    multiple
                     style={{ display: 'none' }}
                     onChange={handleFileInput}
                     disabled={uploadProgress.active}

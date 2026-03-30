@@ -7,6 +7,7 @@ export const usePeer = () => {
     const [roomPassword, setRoomPassword] = useState<string | null>(null);
     const [messages, setMessages] = useState<(TextMessage | SysMessage)[]>([]);
     const [files, setFiles] = useState<FileMetadata[]>([]);
+    const [onlineCount, setOnlineCount] = useState<number>(0);
 
     const [uploadProgress, setUploadProgress] = useState<{ progress: number, active: boolean }>({ progress: 0, active: false });
     const socketRef = useRef<Socket | null>(null);
@@ -41,6 +42,10 @@ export const usePeer = () => {
 
         socket.on('files-updated', (updatedFiles: FileMetadata[]) => {
             setFiles(updatedFiles);
+        });
+
+        socket.on('user_count', (count: number) => {
+            setOnlineCount(count);
         });
 
         return () => {
@@ -160,6 +165,7 @@ export const usePeer = () => {
         roomPassword,
         messages,
         files,
+        onlineCount,
         uploadProgress,
         joinRoom,
         leaveRoom,

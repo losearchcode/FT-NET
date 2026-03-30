@@ -6,7 +6,7 @@ import { FileTransfer } from './components/FileTransfer';
 
 function App() {
   const {
-    peerId, roomPassword, messages, files,
+    peerId, roomPassword, messages, files, onlineCount,
     uploadProgress, joinRoom, leaveRoom, sendText, uploadFile, deleteFiles
   } = usePeer();
 
@@ -15,6 +15,7 @@ function App() {
       <ConnectionPanel
         peerId={peerId}
         roomPassword={roomPassword}
+        onlineCount={onlineCount}
         onJoin={joinRoom}
         onLeave={leaveRoom}
       />

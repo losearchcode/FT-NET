@@ -160,6 +160,7 @@ io.on('connection', (socket) => {
         });
 
         socket.to(roomId).emit('sys_message', { content: `User ${senderId} 进入了房间`, timestamp: Date.now() });
+        io.to(roomId).emit('user_count', room.users.size);
     });
 
     socket.on('send_message', (msg) => {
@@ -178,6 +179,7 @@ io.on('connection', (socket) => {
                 room.users.delete(socket.id);
                 console.log(`User ${socket.senderId} left [${socket.roomId}]. Remaining: ${room.users.size}`);
                 socket.to(socket.roomId).emit('sys_message', { content: `User ${socket.senderId} 退出了房间`, timestamp: Date.now() });
+                io.to(socket.roomId).emit('user_count', room.users.size);
 
                 // Automatic Destruction (Garbage Collection)
                 if (room.users.size === 0) {

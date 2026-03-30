@@ -1,14 +1,15 @@
 import { useState } from 'react';
-import { DoorOpen, Globe, KeyRound } from 'lucide-react';
+import { DoorOpen, Globe, KeyRound, Users } from 'lucide-react';
 
 interface RoomLoginPanelProps {
     peerId: string;
     roomPassword: string | null;
+    onlineCount: number;
     onJoin: (password: string) => void;
     onLeave: () => void;
 }
 
-export const ConnectionPanel: React.FC<RoomLoginPanelProps> = ({ peerId, roomPassword, onJoin, onLeave }) => {
+export const ConnectionPanel: React.FC<RoomLoginPanelProps> = ({ peerId, roomPassword, onlineCount, onJoin, onLeave }) => {
     const [passwordInput, setPasswordInput] = useState('');
 
     const handleJoin = (e: React.FormEvent) => {
@@ -51,8 +52,12 @@ export const ConnectionPanel: React.FC<RoomLoginPanelProps> = ({ peerId, roomPas
                         <div style={{ color: 'var(--success)', marginBottom: '1rem', fontWeight: 600 }}>
                             在活跃房间中
                         </div>
-                        <div style={{ fontFamily: 'monospace', fontSize: '1.5rem', marginBottom: '1.5rem', letterSpacing: '2px' }}>
+                        <div style={{ fontFamily: 'monospace', fontSize: '1.5rem', marginBottom: '1rem', letterSpacing: '2px' }}>
                             {roomPassword}
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', marginBottom: '1.5rem', padding: '0.5rem 1rem', background: 'rgba(59, 130, 246, 0.1)', border: '1px solid rgba(59, 130, 246, 0.3)', borderRadius: '8px' }}>
+                            <Users size={16} color="#3b82f6" />
+                            <span style={{ fontSize: '0.9rem', fontWeight: 600, color: '#3b82f6' }}>{onlineCount} 人在线</span>
                         </div>
                         <button onClick={onLeave} style={{ background: '#ef4444', border: '1px solid #7f1d1d' }}>
                             销毁并退出 <DoorOpen size={16} />
