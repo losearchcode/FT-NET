@@ -131,6 +131,48 @@ app.get('/download/:roomId/:fileId', (req, res) => {
     const secondDash = fileId.indexOf('-', firstDash + 1);
     const originalName = fileId.substring(secondDash + 1);
 
+    // 预览模式：内联返回文件流（用于 <img> / <iframe> 等标签的页内渲染）
+    if (req.query.preview === '1') {
+        // 按扩展名推断 MIME 类型，确保浏览器能正确渲染
+        const ext = path.extname(originalName).toLowerCase();
+        const mimeMap = {
+            // 图片
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+            '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+            '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
+            // 文档
+            '.pdf': 'application/pdf',
+            // 文本 & 代码（统一用 charset=utf-8 确保中文正常显示）
+            '.txt': 'text/plain; charset=utf-8', '.log': 'text/plain; charset=utf-8',
+            '.md': 'text/plain; charset=utf-8', '.markdown': 'text/plain; charset=utf-8',
+            '.csv': 'text/plain; charset=utf-8',
+            '.json': 'application/json; charset=utf-8',
+            '.xml': 'text/xml; charset=utf-8',
+            '.yaml': 'text/plain; charset=utf-8', '.yml': 'text/plain; charset=utf-8',
+            '.toml': 'text/plain; charset=utf-8', '.ini': 'text/plain; charset=utf-8',
+            '.conf': 'text/plain; charset=utf-8', '.cfg': 'text/plain; charset=utf-8',
+            '.env': 'text/plain; charset=utf-8',
+            '.js': 'text/plain; charset=utf-8', '.jsx': 'text/plain; charset=utf-8',
+            '.ts': 'text/plain; charset=utf-8', '.tsx': 'text/plain; charset=utf-8',
+            '.css': 'text/plain; charset=utf-8', '.scss': 'text/plain; charset=utf-8',
+            '.less': 'text/plain; charset=utf-8',
+            '.html': 'text/plain; charset=utf-8', '.htm': 'text/plain; charset=utf-8',
+            '.sh': 'text/plain; charset=utf-8', '.bash': 'text/plain; charset=utf-8',
+            '.bat': 'text/plain; charset=utf-8', '.cmd': 'text/plain; charset=utf-8',
+            '.py': 'text/plain; charset=utf-8', '.java': 'text/plain; charset=utf-8',
+            '.c': 'text/plain; charset=utf-8', '.cpp': 'text/plain; charset=utf-8',
+            '.h': 'text/plain; charset=utf-8', '.hpp': 'text/plain; charset=utf-8',
+            '.go': 'text/plain; charset=utf-8', '.rs': 'text/plain; charset=utf-8',
+            '.sql': 'text/plain; charset=utf-8',
+            '.vue': 'text/plain; charset=utf-8', '.svelte': 'text/plain; charset=utf-8'
+        };
+        const contentType = mimeMap[ext] || 'application/octet-stream';
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(originalName)}"`);
+        return res.sendFile(filePath);
+    }
+
+    // 下载模式：强制弹出浏览器保存对话框
     res.download(filePath, originalName);
 });
 

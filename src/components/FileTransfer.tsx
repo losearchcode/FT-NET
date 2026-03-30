@@ -1,5 +1,5 @@
-import { useCallback, useState } from 'react';
-import { Upload, File as FileIcon, Download, Trash2, CheckSquare, Square } from 'lucide-react';
+import { useCallback, useState, useEffect } from 'react';
+import { Upload, File as FileIcon, Download, Trash2, CheckSquare, Square, Eye, X } from 'lucide-react';
 import type { FileMetadata } from '../types';
 
 interface FileTransferProps {
@@ -12,6 +12,34 @@ interface FileTransferProps {
 
 export const FileTransfer = ({ roomId, files, uploadProgress, onUpload, onDeleteFiles }: FileTransferProps) => {
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [previewFile, setPreviewFile] = useState<FileMetadata | null>(null);
+    const [textContent, setTextContent] = useState<string | null>(null);
+    const [textLoading, setTextLoading] = useState(false);
+
+    const isImage = (name: string) => /\.(jpg|jpeg|png|gif|webp|bmp|svg|ico)$/i.test(name);
+    const isPdf = (name: string) => /\.pdf$/i.test(name);
+    const isText = (name: string) => /\.(txt|md|markdown|json|csv|log|yaml|yml|xml|js|jsx|ts|tsx|css|scss|less|html|htm|sh|bash|bat|cmd|py|java|c|cpp|h|hpp|go|rs|toml|ini|conf|cfg|env|sql|vue|svelte)$/i.test(name);
+    const canPreview = (name: string) => isImage(name) || isPdf(name) || isText(name);
+
+    // 文本文件预览：打开预览时自动 fetch 文件内容
+    useEffect(() => {
+        if (previewFile && isText(previewFile.fileName)) {
+            setTextLoading(true);
+            setTextContent(null);
+            fetch(`/download/${roomId}/${previewFile.id}?preview=1`)
+                .then(res => res.text())
+                .then(text => {
+                    setTextContent(text);
+                    setTextLoading(false);
+                })
+                .catch(() => {
+                    setTextContent('⚠️ 文件内容加载失败');
+                    setTextLoading(false);
+                });
+        } else {
+            setTextContent(null);
+        }
+    }, [previewFile, roomId]);
 
     const handleDrop = useCallback((e: any) => {
         e.preventDefault();
@@ -74,6 +102,7 @@ export const FileTransfer = ({ roomId, files, uploadProgress, onUpload, onDelete
     };
 
     return (
+    <>
         <div className="glass-panel animate-slide-up file-transfer-container">
             <h2 style={{ fontSize: '1.25rem', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 <FileIcon size={20} color="#8b5cf6" />
@@ -163,6 +192,11 @@ export const FileTransfer = ({ roomId, files, uploadProgress, onUpload, onDelete
                                     </div>
                                 </div>
                                 <div style={{ display: 'flex', gap: '0.5rem' }}>
+                                    {canPreview(file.fileName) && (
+                                        <button onClick={() => setPreviewFile(file)} style={{ padding: '0.4rem', background: 'rgba(139, 92, 246, 0.1)', color: '#8b5cf6', border: 'none', borderRadius: '6px', cursor: 'pointer' }} title="预览文件">
+                                            <Eye size={16} />
+                                        </button>
+                                    )}
                                     <button onClick={() => downloadFile(file)} style={{ padding: '0.4rem', background: 'rgba(59, 130, 246, 0.1)', color: '#3b82f6', border: 'none', borderRadius: '6px', cursor: 'pointer' }} title="点此从服务器下载">
                                         <Download size={16} />
                                     </button>
@@ -176,5 +210,46 @@ export const FileTransfer = ({ roomId, files, uploadProgress, onUpload, onDelete
                 </div>
             </div>
         </div>
+
+        {/* 文件预览弹窗 */}
+        {previewFile && (
+            <div onClick={() => setPreviewFile(null)} style={{
+                position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+                background: 'rgba(0, 0, 0, 0.85)', backdropFilter: 'blur(8px)',
+                display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                zIndex: 9999, padding: '2rem', cursor: 'pointer'
+            }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1rem' }}>
+                    <span style={{ color: '#fff', fontSize: '1rem', fontWeight: 600 }}>{previewFile.fileName}</span>
+                    <button onClick={() => setPreviewFile(null)} style={{ padding: '0.4rem', background: 'rgba(255,255,255,0.1)', color: '#fff', border: 'none', borderRadius: '50%', cursor: 'pointer' }}>
+                        <X size={20} />
+                    </button>
+                </div>
+                <div onClick={(e) => e.stopPropagation()} style={{ maxWidth: '90vw', maxHeight: '80vh', overflow: 'auto', borderRadius: '12px', boxShadow: '0 8px 32px rgba(0,0,0,0.5)' }}>
+                    {isImage(previewFile.fileName) && (
+                        <img src={`/download/${roomId}/${previewFile.id}?preview=1`} alt={previewFile.fileName} style={{ maxWidth: '100%', maxHeight: '80vh', borderRadius: '12px', display: 'block' }} />
+                    )}
+                    {isPdf(previewFile.fileName) && (
+                        <iframe src={`/download/${roomId}/${previewFile.id}?preview=1`} title={previewFile.fileName} style={{ width: '80vw', height: '80vh', border: 'none', borderRadius: '12px', background: '#fff' }} />
+                    )}
+                    {isText(previewFile.fileName) && (
+                        <div style={{
+                            width: '80vw', maxHeight: '80vh', overflow: 'auto',
+                            background: 'rgba(15, 23, 42, 0.95)', border: '1px solid rgba(255,255,255,0.1)',
+                            borderRadius: '12px', padding: '1.5rem',
+                            fontFamily: "'Consolas', 'Monaco', 'Courier New', monospace",
+                            fontSize: '0.85rem', lineHeight: '1.7', color: '#e2e8f0'
+                        }}>
+                            {textLoading ? (
+                                <div style={{ textAlign: 'center', color: '#94a3b8', padding: '2rem' }}>正在加载文件内容...</div>
+                            ) : (
+                                <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{textContent}</pre>
+                            )}
+                        </div>
+                    )}
+                </div>
+            </div>
+        )}
+    </>
     );
 };
