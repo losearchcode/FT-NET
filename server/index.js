@@ -1,14 +1,12 @@
-import express from 'express';
-import { Server } from 'socket.io';
 import cors from 'cors';
-import http from 'http';
-import multer from 'multer';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
+import express from 'express';
+import fs from 'fs';
+import http from 'http';
+import path from 'path';
+import { Server } from 'socket.io';
+import { fileURLToPath } from 'url';
 
-// 注入读取外部宏定义环境表配置 (.env)
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -17,82 +15,169 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// 终极武器：让 Node直接代理分发所有前端的静态网页文件！
-// 这样我们从始至终就只用 1 个全能端口了，永不再惧怕被防火墙阻断分离端口。
 app.use(express.static(path.join(__dirname, '../dist')));
 
-// Ensure uploads directory exists
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) {
-    fs.mkdirSync(UPLOADS_DIR);
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-// Config Multer for chunk-less HTTP File Storage
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        const roomId = req.params.roomId;
-        const roomDir = path.join(UPLOADS_DIR, roomId);
-        if (!fs.existsSync(roomDir)) {
-            fs.mkdirSync(roomDir, { recursive: true });
-        }
-        cb(null, roomDir);
-    },
-    filename: (req, file, cb) => {
-        const uniquePrefix = Date.now() + '-' + Math.round(Math.random() * 1e4);
-        // We use latin1 encode/decode to prevent multer from breaking raw utf-8 original filenames
-        const utf8Name = Buffer.from(file.originalname, 'latin1').toString('utf8');
-        cb(null, uniquePrefix + '-' + utf8Name);
-    }
-});
-const upload = multer({ 
-    storage,
-    limits: { fileSize: 10 * 1024 * 1024 * 1024 } // 10GB 上限
-});
-
-// 从环境宏定义文件中抽取指定的端口号，若未定义或异常则平滑降级 fallback 到兜底的 31208
 const port = process.env.PORT || 31208;
 const server = http.createServer(app);
+server.timeout = 0;
+server.headersTimeout = 0;
+server.requestTimeout = 0;
+server.keepAliveTimeout = 0;
 
-// 【关键修复】彻底移除 Node.js http 服务器的默认超时限制
-// 这是大文件传输被中途静默截断的根因！
-server.timeout = 0;           // 读写总超时 → 无限
-server.headersTimeout = 0;    // 请求头等待超时 → 无限
-server.requestTimeout = 0;    // 整个请求超时 → 无限
-server.keepAliveTimeout = 0;  // 保活超时 → 无限
-
-const io = new Server(server, { 
+const io = new Server(server, {
     cors: { origin: '*' },
-    maxHttpBufferSize: 1e8 // Socket.io 单消息包体上限 100MB
+    maxHttpBufferSize: 1e8,
 });
 
-// In-Memory Database: rooms.get(roomId) -> { messages: [], files: [], users: Set }
 const rooms = new Map();
+const uploadSessions = new Map();
 
-// --- HTTP ENDPOINTS FOR FILES ---
+const makeId = () => `${Date.now()}-${Math.round(Math.random() * 1e8)}`;
 
-app.post('/upload/:roomId', upload.single('file'), (req, res) => {
+const ensureRoomDir = (roomId) => {
+    const roomDir = path.join(UPLOADS_DIR, roomId);
+    if (!fs.existsSync(roomDir)) {
+        fs.mkdirSync(roomDir, { recursive: true });
+    }
+    return roomDir;
+};
+
+const cleanupUploadSession = (uploadId) => {
+    const session = uploadSessions.get(uploadId);
+    if (!session) {
+        return;
+    }
+
+    if (fs.existsSync(session.tempFilePath)) {
+        fs.rmSync(session.tempFilePath, { force: true });
+    }
+
+    uploadSessions.delete(uploadId);
+};
+
+const cleanupRoomUploadSessions = (roomId) => {
+    for (const [uploadId, session] of uploadSessions.entries()) {
+        if (session.roomId === roomId) {
+            cleanupUploadSession(uploadId);
+        }
+    }
+};
+
+app.post('/upload/init/:roomId', (req, res) => {
     const { roomId } = req.params;
-    const { senderId } = req.body;
-    if (!req.file) return res.status(400).send('No file uploaded.');
+    const { fileName, fileSize, fileType, senderId, encrypted } = req.body ?? {};
 
     const room = rooms.get(roomId);
-    if (!room) return res.status(404).send('Room not found or empty.');
+    if (!room) {
+        return res.status(404).send('Room not found or empty.');
+    }
 
-    const utf8Name = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
-    const fileMeta = {
-        id: req.file.filename,
-        fileName: utf8Name,
-        fileSize: req.file.size,
-        fileType: req.file.mimetype,
-        uploadedAt: Date.now(),
-        senderId: senderId || 'Unknown'
-    };
+    if (typeof fileName !== 'string' || !fileName.trim() || typeof fileSize !== 'number') {
+        return res.status(400).send('Invalid upload metadata.');
+    }
 
-    room.files.push(fileMeta);
-    io.to(roomId).emit('file-added', fileMeta);
+    const roomDir = ensureRoomDir(roomId);
+    const uniquePrefix = `${Date.now()}-${Math.round(Math.random() * 1e4)}`;
+    const finalFileName = `${uniquePrefix}-${fileName}`;
+    const uploadId = makeId();
+    const tempFilePath = path.join(roomDir, `${finalFileName}.part.${uploadId}`);
 
-    res.status(200).json({ success: true, file: fileMeta });
+    fs.writeFileSync(tempFilePath, Buffer.alloc(0));
+
+    uploadSessions.set(uploadId, {
+        roomId,
+        tempFilePath,
+        finalFileName,
+        nextChunkIndex: 0,
+        receivedChunkSizes: new Map(),
+        fileMeta: {
+            id: finalFileName,
+            fileName,
+            fileSize,
+            fileType: fileType || 'application/octet-stream',
+            uploadedAt: Date.now(),
+            senderId: senderId || 'Unknown',
+            encrypted: Boolean(encrypted),
+        },
+    });
+
+    return res.json({ success: true, uploadId });
+});
+
+app.post(
+    '/upload/chunk/:roomId/:uploadId',
+    express.raw({ type: 'application/octet-stream', limit: '20mb' }),
+    (req, res) => {
+        const { roomId, uploadId } = req.params;
+        const chunkIndex = Number(req.query.index);
+        const session = uploadSessions.get(uploadId);
+
+        if (!session || session.roomId !== roomId) {
+            return res.status(404).send('Upload session not found.');
+        }
+
+        if (!Number.isInteger(chunkIndex) || chunkIndex < 0) {
+            return res.status(400).send('Invalid chunk index.');
+        }
+
+        if (!Buffer.isBuffer(req.body)) {
+            return res.status(400).send('Invalid chunk body.');
+        }
+
+        const previousChunkSize = session.receivedChunkSizes.get(chunkIndex);
+        if (chunkIndex < session.nextChunkIndex) {
+            if (previousChunkSize === req.body.length) {
+                return res.json({ success: true, duplicate: true });
+            }
+            return res.status(409).send('Conflicting duplicate chunk.');
+        }
+
+        if (chunkIndex > session.nextChunkIndex) {
+            return res.status(409).send('Out-of-order chunk.');
+        }
+
+        fs.appendFileSync(session.tempFilePath, req.body);
+        session.receivedChunkSizes.set(chunkIndex, req.body.length);
+        session.nextChunkIndex += 1;
+
+        return res.json({ success: true, nextChunkIndex: session.nextChunkIndex });
+    },
+);
+
+app.post('/upload/complete/:roomId/:uploadId', (req, res) => {
+    const { roomId, uploadId } = req.params;
+    const room = rooms.get(roomId);
+    const session = uploadSessions.get(uploadId);
+
+    if (!room || !session || session.roomId !== roomId) {
+        return res.status(404).send('Upload session not found.');
+    }
+
+    const finalFilePath = path.join(ensureRoomDir(roomId), session.finalFileName);
+    fs.renameSync(session.tempFilePath, finalFilePath);
+
+    room.files.push(session.fileMeta);
+    io.to(roomId).emit('file-added', session.fileMeta);
+    uploadSessions.delete(uploadId);
+
+    return res.json({ success: true, file: session.fileMeta });
+});
+
+app.post('/upload/abort/:roomId/:uploadId', (req, res) => {
+    const { roomId, uploadId } = req.params;
+    const session = uploadSessions.get(uploadId);
+
+    if (!session || session.roomId !== roomId) {
+        return res.json({ success: true });
+    }
+
+    cleanupUploadSession(uploadId);
+    return res.json({ success: true });
 });
 
 app.post('/delete-files/:roomId', (req, res) => {
@@ -100,13 +185,16 @@ app.post('/delete-files/:roomId', (req, res) => {
     const { fileIds } = req.body;
 
     const room = rooms.get(roomId);
-    if (!room || !Array.isArray(fileIds)) return res.status(400).send('Invalid request');
+    if (!room || !Array.isArray(fileIds)) {
+        return res.status(400).send('Invalid request');
+    }
 
-    fileIds.forEach(id => {
-        const fileIndex = room.files.findIndex(f => f.id === id);
+    fileIds.forEach((id) => {
+        const fileIndex = room.files.findIndex((file) => file.id === id);
         if (fileIndex !== -1) {
             room.files.splice(fileIndex, 1);
         }
+
         const filePath = path.join(UPLOADS_DIR, roomId, id);
         if (fs.existsSync(filePath)) {
             fs.unlinkSync(filePath);
@@ -114,70 +202,81 @@ app.post('/delete-files/:roomId', (req, res) => {
     });
 
     io.to(roomId).emit('files-updated', room.files);
-    res.json({ success: true });
+    return res.json({ success: true });
 });
 
 app.get('/download/:roomId/:fileId', (req, res) => {
     const { roomId, fileId } = req.params;
     const filePath = path.join(UPLOADS_DIR, roomId, fileId);
 
-    // Safety check
     if (!fs.existsSync(filePath)) {
         return res.status(404).send('File not found or already destroyed.');
     }
 
-    // Extract original name from format: timestamp-random-OriginalName.ext
     const firstDash = fileId.indexOf('-');
     const secondDash = fileId.indexOf('-', firstDash + 1);
     const originalName = fileId.substring(secondDash + 1);
 
-    // 预览模式：内联返回文件流（用于 <img> / <iframe> 等标签的页内渲染）
     if (req.query.preview === '1') {
-        // 按扩展名推断 MIME 类型，确保浏览器能正确渲染
         const ext = path.extname(originalName).toLowerCase();
         const mimeMap = {
-            // 图片
-            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
-            '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
-            '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
-            // 文档
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+            '.bmp': 'image/bmp',
+            '.svg': 'image/svg+xml',
+            '.ico': 'image/x-icon',
             '.pdf': 'application/pdf',
-            // 文本 & 代码（统一用 charset=utf-8 确保中文正常显示）
-            '.txt': 'text/plain; charset=utf-8', '.log': 'text/plain; charset=utf-8',
-            '.md': 'text/plain; charset=utf-8', '.markdown': 'text/plain; charset=utf-8',
+            '.txt': 'text/plain; charset=utf-8',
+            '.log': 'text/plain; charset=utf-8',
+            '.md': 'text/plain; charset=utf-8',
+            '.markdown': 'text/plain; charset=utf-8',
             '.csv': 'text/plain; charset=utf-8',
             '.json': 'application/json; charset=utf-8',
             '.xml': 'text/xml; charset=utf-8',
-            '.yaml': 'text/plain; charset=utf-8', '.yml': 'text/plain; charset=utf-8',
-            '.toml': 'text/plain; charset=utf-8', '.ini': 'text/plain; charset=utf-8',
-            '.conf': 'text/plain; charset=utf-8', '.cfg': 'text/plain; charset=utf-8',
+            '.yaml': 'text/plain; charset=utf-8',
+            '.yml': 'text/plain; charset=utf-8',
+            '.toml': 'text/plain; charset=utf-8',
+            '.ini': 'text/plain; charset=utf-8',
+            '.conf': 'text/plain; charset=utf-8',
+            '.cfg': 'text/plain; charset=utf-8',
             '.env': 'text/plain; charset=utf-8',
-            '.js': 'text/plain; charset=utf-8', '.jsx': 'text/plain; charset=utf-8',
-            '.ts': 'text/plain; charset=utf-8', '.tsx': 'text/plain; charset=utf-8',
-            '.css': 'text/plain; charset=utf-8', '.scss': 'text/plain; charset=utf-8',
+            '.js': 'text/plain; charset=utf-8',
+            '.jsx': 'text/plain; charset=utf-8',
+            '.ts': 'text/plain; charset=utf-8',
+            '.tsx': 'text/plain; charset=utf-8',
+            '.css': 'text/plain; charset=utf-8',
+            '.scss': 'text/plain; charset=utf-8',
             '.less': 'text/plain; charset=utf-8',
-            '.html': 'text/plain; charset=utf-8', '.htm': 'text/plain; charset=utf-8',
-            '.sh': 'text/plain; charset=utf-8', '.bash': 'text/plain; charset=utf-8',
-            '.bat': 'text/plain; charset=utf-8', '.cmd': 'text/plain; charset=utf-8',
-            '.py': 'text/plain; charset=utf-8', '.java': 'text/plain; charset=utf-8',
-            '.c': 'text/plain; charset=utf-8', '.cpp': 'text/plain; charset=utf-8',
-            '.h': 'text/plain; charset=utf-8', '.hpp': 'text/plain; charset=utf-8',
-            '.go': 'text/plain; charset=utf-8', '.rs': 'text/plain; charset=utf-8',
+            '.html': 'text/plain; charset=utf-8',
+            '.htm': 'text/plain; charset=utf-8',
+            '.sh': 'text/plain; charset=utf-8',
+            '.bash': 'text/plain; charset=utf-8',
+            '.bat': 'text/plain; charset=utf-8',
+            '.cmd': 'text/plain; charset=utf-8',
+            '.py': 'text/plain; charset=utf-8',
+            '.java': 'text/plain; charset=utf-8',
+            '.c': 'text/plain; charset=utf-8',
+            '.cpp': 'text/plain; charset=utf-8',
+            '.h': 'text/plain; charset=utf-8',
+            '.hpp': 'text/plain; charset=utf-8',
+            '.go': 'text/plain; charset=utf-8',
+            '.rs': 'text/plain; charset=utf-8',
             '.sql': 'text/plain; charset=utf-8',
-            '.vue': 'text/plain; charset=utf-8', '.svelte': 'text/plain; charset=utf-8'
+            '.vue': 'text/plain; charset=utf-8',
+            '.svelte': 'text/plain; charset=utf-8',
         };
+
         const contentType = mimeMap[ext] || 'application/octet-stream';
         res.setHeader('Content-Type', contentType);
         res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(originalName)}"`);
         return res.sendFile(filePath);
     }
 
-    // 下载模式：强制弹出浏览器保存对话框
-    res.download(filePath, originalName);
+    return res.download(filePath, originalName);
 });
-
-
-// --- SOCKET.IO FOR CHAT & ROOM LIFECYCLE ---
 
 io.on('connection', (socket) => {
     socket.on('join_room', ({ roomId, senderId }) => {
@@ -185,7 +284,6 @@ io.on('connection', (socket) => {
         socket.roomId = roomId;
         socket.senderId = senderId;
 
-        // Create Room if not exists
         if (!rooms.has(roomId)) {
             rooms.set(roomId, { messages: [], files: [], users: new Set() });
             console.log(`Room [${roomId}] dynamically created by ${senderId}`);
@@ -195,47 +293,56 @@ io.on('connection', (socket) => {
         room.users.add(socket.id);
         console.log(`User ${senderId} joined [${roomId}]. Living users: ${room.users.size}`);
 
-        // Sync old data to the newcomer
         socket.emit('room_history', {
             messages: room.messages,
-            files: room.files
+            files: room.files,
         });
 
-        socket.to(roomId).emit('sys_message', { content: `User ${senderId} 进入了房间`, timestamp: Date.now() });
+        socket.to(roomId).emit('sys_message', { content: `User ${senderId} entered the room`, timestamp: Date.now() });
         io.to(roomId).emit('user_count', room.users.size);
     });
 
-    socket.on('send_message', (msg) => {
-        if (!socket.roomId) return;
-        const room = rooms.get(socket.roomId);
-        if (room) {
-            room.messages.push(msg);
-            socket.to(socket.roomId).emit('new_message', msg);
+    socket.on('send_message', (message) => {
+        if (!socket.roomId) {
+            return;
         }
+
+        const room = rooms.get(socket.roomId);
+        if (!room) {
+            return;
+        }
+
+        room.messages.push(message);
+        socket.to(socket.roomId).emit('new_message', message);
     });
 
     socket.on('disconnect', () => {
-        if (socket.roomId) {
-            const room = rooms.get(socket.roomId);
-            if (room) {
-                room.users.delete(socket.id);
-                console.log(`User ${socket.senderId} left [${socket.roomId}]. Remaining: ${room.users.size}`);
-                socket.to(socket.roomId).emit('sys_message', { content: `User ${socket.senderId} 退出了房间`, timestamp: Date.now() });
-                io.to(socket.roomId).emit('user_count', room.users.size);
+        if (!socket.roomId) {
+            return;
+        }
 
-                // Automatic Destruction (Garbage Collection)
-                if (room.users.size === 0) {
-                    rooms.delete(socket.roomId);
-                    const roomDir = path.join(UPLOADS_DIR, socket.roomId);
-                    fs.rm(roomDir, { recursive: true, force: true }, (err) => {
-                        if (err && err.code !== 'ENOENT') {
-                            console.error(`Failed to delete room files for [${socket.roomId}]`, err);
-                        } else {
-                            console.log(`♻️ Room [${socket.roomId}] is now empty. All Data & Files have been permanently DESTROYED.`);
-                        }
-                    });
+        const room = rooms.get(socket.roomId);
+        if (!room) {
+            return;
+        }
+
+        room.users.delete(socket.id);
+        console.log(`User ${socket.senderId} left [${socket.roomId}]. Remaining: ${room.users.size}`);
+        socket.to(socket.roomId).emit('sys_message', { content: `User ${socket.senderId} left the room`, timestamp: Date.now() });
+        io.to(socket.roomId).emit('user_count', room.users.size);
+
+        if (room.users.size === 0) {
+            rooms.delete(socket.roomId);
+            cleanupRoomUploadSessions(socket.roomId);
+            const roomDir = path.join(UPLOADS_DIR, socket.roomId);
+
+            fs.rm(roomDir, { recursive: true, force: true }, (error) => {
+                if (error && error.code !== 'ENOENT') {
+                    console.error(`Failed to delete room files for [${socket.roomId}]`, error);
+                } else {
+                    console.log(`Room [${socket.roomId}] is now empty. All data and files were destroyed.`);
                 }
-            }
+            });
         }
     });
 });

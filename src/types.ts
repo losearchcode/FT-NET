@@ -11,6 +11,7 @@ export interface BaseMessage {
 export interface TextMessage extends BaseMessage {
   type: 'TEXT';
   content: string;
+  isEncrypted?: boolean;
 }
 
 export interface SysMessage extends BaseMessage {
@@ -20,12 +21,12 @@ export interface SysMessage extends BaseMessage {
 
 export type P2PMessage = TextMessage | SysMessage;
 
-// Centralized Room File Metadata
 export interface FileMetadata {
-  id: string;         // Unique server physical ID
+  id: string;
   fileName: string;
   fileSize: number;
   fileType: string;
   uploadedAt: number;
   senderId: string;
+  encrypted: boolean;
 }

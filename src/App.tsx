@@ -1,4 +1,4 @@
-
+import { useEffect, useRef } from 'react';
 import { usePeer } from './hooks/usePeer';
 import { ConnectionPanel } from './components/ConnectionPanel';
 import { ChatBox } from './components/ChatBox';
@@ -6,9 +6,28 @@ import { FileTransfer } from './components/FileTransfer';
 
 function App() {
   const {
-    peerId, roomPassword, messages, files, onlineCount,
-    uploadProgress, joinRoom, leaveRoom, sendText, uploadFile, deleteFiles
+    peerId,
+    roomPassword,
+    hashedRoomId,
+    encryptionKey,
+    messages,
+    files,
+    onlineCount,
+    uploadProgress,
+    joinRoom,
+    leaveRoom,
+    sendText,
+    uploadFile,
+    cancelUpload,
+    deleteFiles,
   } = usePeer();
+  const mainContentRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (roomPassword && hashedRoomId) {
+      mainContentRef.current?.scrollTo({ top: 0, behavior: 'auto' });
+    }
+  }, [roomPassword, hashedRoomId]);
 
   return (
     <div className="app-container">
@@ -20,15 +39,17 @@ function App() {
         onLeave={leaveRoom}
       />
 
-      <div className="main-content">
-        {roomPassword ? (
+      <div className="main-content" ref={mainContentRef}>
+        {roomPassword && hashedRoomId && encryptionKey ? (
           <>
             <FileTransfer
               files={files}
               uploadProgress={uploadProgress}
               onUpload={uploadFile}
+              onCancelUpload={cancelUpload}
               onDeleteFiles={deleteFiles}
-              roomId={roomPassword}
+              roomId={hashedRoomId}
+              roomPassword={roomPassword}
             />
             <ChatBox
               messages={messages}
