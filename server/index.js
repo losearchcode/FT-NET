@@ -38,6 +38,15 @@ const rooms = new Map();
 const uploadSessions = new Map();
 
 const makeId = () => `${Date.now()}-${Math.round(Math.random() * 1e8)}`;
+const isNonEmptyString = (value) => typeof value === 'string' && value.trim().length > 0;
+
+const isEncryptedMetadataPayloadV2 = (value) => (
+    Boolean(value)
+    && typeof value === 'object'
+    && value.version === 'v2'
+    && isNonEmptyString(value.iv)
+    && isNonEmptyString(value.ciphertext)
+);
 
 const ensureRoomDir = (roomId) => {
     const roomDir = path.join(UPLOADS_DIR, roomId);
@@ -68,42 +77,96 @@ const cleanupRoomUploadSessions = (roomId) => {
     }
 };
 
+const getRoomCapabilities = (room) => ({
+    messageCryptoV2Enabled:
+        room.users.size > 0
+        && Array.from(room.users.values()).every((user) => user.webCryptoV2),
+    fileCryptoV2Enabled:
+        room.users.size > 0
+        && Array.from(room.users.values()).every((user) => user.webCryptoV2),
+});
+
+const findFileMeta = (roomId, fileId) => {
+    const room = rooms.get(roomId);
+    if (!room) {
+        return null;
+    }
+
+    return room.files.find((file) => file.id === fileId) ?? null;
+};
+
+const getLegacyFileNameFromId = (fileId) => {
+    const firstDash = fileId.indexOf('-');
+    const secondDash = fileId.indexOf('-', firstDash + 1);
+    if (firstDash === -1 || secondDash === -1 || secondDash + 1 >= fileId.length) {
+        return null;
+    }
+
+    return fileId.substring(secondDash + 1);
+};
+
 app.post('/upload/init/:roomId', (req, res) => {
     const { roomId } = req.params;
-    const { fileName, fileSize, fileType, senderId, encrypted } = req.body ?? {};
+    const {
+        fileName,
+        encryptedMetadata,
+        fileSize,
+        fileType,
+        senderId,
+        encrypted,
+        securityMode,
+        encryptionVersion,
+        algorithm,
+    } = req.body ?? {};
 
     const room = rooms.get(roomId);
     if (!room) {
         return res.status(404).send('Room not found or empty.');
     }
 
-    if (typeof fileName !== 'string' || !fileName.trim() || typeof fileSize !== 'number') {
+    const normalizedFileName = isNonEmptyString(fileName) ? fileName.trim() : null;
+    const normalizedEncryptedMetadata = isEncryptedMetadataPayloadV2(encryptedMetadata)
+        ? encryptedMetadata
+        : null;
+
+    if ((!normalizedFileName && !normalizedEncryptedMetadata) || typeof fileSize !== 'number') {
         return res.status(400).send('Invalid upload metadata.');
     }
 
     const roomDir = ensureRoomDir(roomId);
-    const uniquePrefix = `${Date.now()}-${Math.round(Math.random() * 1e4)}`;
-    const finalFileName = `${uniquePrefix}-${fileName}`;
+    const storedFileId = makeId();
     const uploadId = makeId();
-    const tempFilePath = path.join(roomDir, `${finalFileName}.part.${uploadId}`);
+    const tempFilePath = path.join(roomDir, `${storedFileId}.part.${uploadId}`);
 
     fs.writeFileSync(tempFilePath, Buffer.alloc(0));
+
+    const fileMeta = {
+        id: storedFileId,
+        fileSize,
+        fileType: fileType || 'application/octet-stream',
+        uploadedAt: Date.now(),
+        senderId: senderId || 'Unknown',
+        encrypted: Boolean(encrypted),
+        securityMode: securityMode || (encrypted ? 'encrypted' : 'plain'),
+        encryptionVersion,
+        algorithm,
+    };
+
+    if (normalizedFileName) {
+        fileMeta.fileName = normalizedFileName;
+    }
+
+    if (normalizedEncryptedMetadata) {
+        fileMeta.encryptedMetadata = normalizedEncryptedMetadata;
+    }
 
     uploadSessions.set(uploadId, {
         roomId,
         tempFilePath,
-        finalFileName,
+        finalFileName: storedFileId,
         nextChunkIndex: 0,
         receivedChunkSizes: new Map(),
-        fileMeta: {
-            id: finalFileName,
-            fileName,
-            fileSize,
-            fileType: fileType || 'application/octet-stream',
-            uploadedAt: Date.now(),
-            senderId: senderId || 'Unknown',
-            encrypted: Boolean(encrypted),
-        },
+        fileMeta,
     });
 
     return res.json({ success: true, uploadId });
@@ -182,19 +245,28 @@ app.post('/upload/abort/:roomId/:uploadId', (req, res) => {
 
 app.post('/delete-files/:roomId', (req, res) => {
     const { roomId } = req.params;
-    const { fileIds } = req.body;
+    const { fileIds, senderId } = req.body;
 
     const room = rooms.get(roomId);
-    if (!room || !Array.isArray(fileIds)) {
+    if (!room || !Array.isArray(fileIds) || !senderId) {
         return res.status(400).send('Invalid request');
     }
 
-    fileIds.forEach((id) => {
-        const fileIndex = room.files.findIndex((file) => file.id === id);
-        if (fileIndex !== -1) {
-            room.files.splice(fileIndex, 1);
+    let isAuthorized = false;
+    for (const user of room.users.values()) {
+        if (user.senderId === senderId) {
+            isAuthorized = true;
+            break;
         }
+    }
 
+    if (!isAuthorized) {
+        return res.status(403).send('Unauthorized to delete files in this room');
+    }
+
+    room.files = room.files.filter((file) => !fileIds.includes(file.id));
+
+    fileIds.forEach((id) => {
         const filePath = path.join(UPLOADS_DIR, roomId, id);
         if (fs.existsSync(filePath)) {
             fs.unlinkSync(filePath);
@@ -208,14 +280,13 @@ app.post('/delete-files/:roomId', (req, res) => {
 app.get('/download/:roomId/:fileId', (req, res) => {
     const { roomId, fileId } = req.params;
     const filePath = path.join(UPLOADS_DIR, roomId, fileId);
+    const fileMeta = findFileMeta(roomId, fileId);
 
     if (!fs.existsSync(filePath)) {
         return res.status(404).send('File not found or already destroyed.');
     }
 
-    const firstDash = fileId.indexOf('-');
-    const secondDash = fileId.indexOf('-', firstDash + 1);
-    const originalName = fileId.substring(secondDash + 1);
+    const originalName = fileMeta?.fileName || getLegacyFileNameFromId(fileId) || fileId;
 
     if (req.query.preview === '1') {
         const ext = path.extname(originalName).toLowerCase();
@@ -269,7 +340,7 @@ app.get('/download/:roomId/:fileId', (req, res) => {
             '.svelte': 'text/plain; charset=utf-8',
         };
 
-        const contentType = mimeMap[ext] || 'application/octet-stream';
+        const contentType = fileMeta?.fileType || mimeMap[ext] || 'application/octet-stream';
         res.setHeader('Content-Type', contentType);
         res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(originalName)}"`);
         return res.sendFile(filePath);
@@ -279,25 +350,30 @@ app.get('/download/:roomId/:fileId', (req, res) => {
 });
 
 io.on('connection', (socket) => {
-    socket.on('join_room', ({ roomId, senderId }) => {
+    socket.on('join_room', ({ roomId, senderId, capabilities = {} }) => {
         socket.join(roomId);
         socket.roomId = roomId;
         socket.senderId = senderId;
 
         if (!rooms.has(roomId)) {
-            rooms.set(roomId, { messages: [], files: [], users: new Set() });
+            rooms.set(roomId, { messages: [], files: [], users: new Map() });
             console.log(`Room [${roomId}] dynamically created by ${senderId}`);
         }
 
         const room = rooms.get(roomId);
-        room.users.add(socket.id);
+        room.users.set(socket.id, {
+            senderId,
+            webCryptoV2: Boolean(capabilities.webCryptoV2),
+        });
         console.log(`User ${senderId} joined [${roomId}]. Living users: ${room.users.size}`);
+        const roomCapabilities = getRoomCapabilities(room);
 
         socket.emit('room_history', {
             messages: room.messages,
             files: room.files,
         });
 
+        io.to(roomId).emit('room_capabilities', roomCapabilities);
         socket.to(roomId).emit('sys_message', { content: `User ${senderId} entered the room`, timestamp: Date.now() });
         io.to(roomId).emit('user_count', room.users.size);
     });
@@ -330,6 +406,7 @@ io.on('connection', (socket) => {
         console.log(`User ${socket.senderId} left [${socket.roomId}]. Remaining: ${room.users.size}`);
         socket.to(socket.roomId).emit('sys_message', { content: `User ${socket.senderId} left the room`, timestamp: Date.now() });
         io.to(socket.roomId).emit('user_count', room.users.size);
+        io.to(socket.roomId).emit('room_capabilities', getRoomCapabilities(room));
 
         if (room.users.size === 0) {
             rooms.delete(socket.roomId);

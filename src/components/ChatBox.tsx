@@ -4,7 +4,7 @@ import type { P2PMessage, TextMessage } from '../types';
 
 interface ChatBoxProps {
     messages: P2PMessage[];
-    onSendMessage: (msg: string) => void;
+    onSendMessage: (msg: string) => void | Promise<void>;
     myId: string;
 }
 

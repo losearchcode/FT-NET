@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
+import { startTransition, useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
 import { Upload, File as FileIcon, Download, Trash2, CheckSquare, Square, Eye, X, Info } from 'lucide-react';
 import type { FileMetadata } from '../types';
 import DecryptWorker from '../workers/decryptWorker?worker';
+import DecryptWorkerV2 from '../workers/decryptWorkerV2?worker';
+import { isFileCryptoV2Available } from '../utils/fileCryptoV2';
 
 interface FileTransferProps {
     roomId: string;
@@ -29,6 +31,15 @@ type DownloadProgressState = {
     stage: 'downloading' | 'decrypting' | 'saving' | 'idle';
 };
 
+const DOWNLOAD_PROGRESS_THROTTLE_MS = 80;
+const DOWNLOAD_PROGRESS_MIN_STEP = 0.01;
+const DOWNLOAD_PROGRESS_INITIAL_STATE: DownloadProgressState = {
+    active: false,
+    fileName: '',
+    progress: 0,
+    stage: 'idle',
+};
+
 type SaveFilePickerOptions = {
     suggestedName?: string;
 };
@@ -46,6 +57,8 @@ type SaveFileHandle = {
 type WindowWithSavePicker = Window & typeof globalThis & {
     showSaveFilePicker?: (options?: SaveFilePickerOptions) => Promise<SaveFileHandle>;
 };
+
+type DecryptWorkerConstructor = new () => Worker;
 
 const MIME_TYPE_BY_EXT: Record<string, string> = {
     jpg: 'image/jpeg',
@@ -101,6 +114,7 @@ const isImage = (name: string) => /\.(jpg|jpeg|png|gif|webp|bmp|svg|ico)$/i.test
 const isPdf = (name: string) => /\.pdf$/i.test(name);
 const isText = (name: string) => /\.(txt|md|markdown|json|csv|log|yaml|yml|xml|js|jsx|ts|tsx|css|scss|less|html|htm|sh|bash|bat|cmd|py|java|c|cpp|h|hpp|go|rs|toml|ini|conf|cfg|env|sql|vue|svelte)$/i.test(name);
 const canPreview = (name: string) => isImage(name) || isPdf(name) || isText(name);
+const isLockedMetadataFile = (file: FileMetadata) => file.metadataState === 'locked';
 
 const getMimeType = (name: string): string => {
     const extension = name.split('.').pop()?.toLowerCase() ?? '';
@@ -115,6 +129,7 @@ const streamDecryptToBlob = async (
     response: Response,
     key: string,
     mimeType: string,
+    WorkerCtor: DecryptWorkerConstructor,
     onProgress?: (progress: DownloadProgressState) => void,
     fileName: string = '',
 ): Promise<Blob> => {
@@ -124,7 +139,7 @@ const streamDecryptToBlob = async (
     }
 
     return new Promise((resolve, reject) => {
-        const worker = new DecryptWorker();
+        const worker = new WorkerCtor();
         const reader = body.getReader();
         const chunks: Uint8Array[] = [];
         const totalBytes = Number(response.headers.get('content-length') ?? '0');
@@ -196,6 +211,7 @@ const streamDecryptToWritable = async (
     response: Response,
     key: string,
     writable: WritableFileStream,
+    WorkerCtor: DecryptWorkerConstructor,
     onProgress?: (progress: DownloadProgressState) => void,
     fileName: string = '',
 ) => {
@@ -205,7 +221,7 @@ const streamDecryptToWritable = async (
     }
 
     return new Promise<void>((resolve, reject) => {
-        const worker = new DecryptWorker();
+        const worker = new WorkerCtor();
         const reader = body.getReader();
         const totalBytes = Number(response.headers.get('content-length') ?? '0');
         let loadedBytes = 0;
@@ -291,7 +307,7 @@ const streamDecryptToWritable = async (
                             active: true,
                             fileName,
                             progress: Math.min(loadedBytes / totalBytes, 0.98),
-                            stage: 'downloading',
+                            stage: 'saving',
                         });
                     }
 
@@ -321,7 +337,15 @@ export const FileTransfer = ({
     onCancelUpload,
     onDeleteFiles,
 }: FileTransferProps) => {
-    const [encryptUploads, setEncryptUploads] = useState(true);
+    const [encryptUploads, setEncryptUploads] = useState(() => {
+        const stored = localStorage.getItem('ft-net-encrypt-uploads');
+        return stored !== 'false';
+    });
+
+    const handleSetEncryptUploads = (value: boolean) => {
+        setEncryptUploads(value);
+        localStorage.setItem('ft-net-encrypt-uploads', String(value));
+    };
     const [fileFilter, setFileFilter] = useState<'all' | 'encrypted' | 'plain'>('all');
     const [showStreamSaveHint, setShowStreamSaveHint] = useState(false);
     const [showUploadModeHint, setShowUploadModeHint] = useState(false);
@@ -330,15 +354,13 @@ export const FileTransfer = ({
     const [textContent, setTextContent] = useState<string | null>(null);
     const [previewUrl, setPreviewUrl] = useState<string | null>(null);
     const [previewLoading, setPreviewLoading] = useState(false);
-    const [downloadProgress, setDownloadProgress] = useState<DownloadProgressState>({
-        active: false,
-        fileName: '',
-        progress: 0,
-        stage: 'idle',
-    });
+    const [downloadProgress, setDownloadProgress] = useState<DownloadProgressState>(DOWNLOAD_PROGRESS_INITIAL_STATE);
     const supportsStreamSave = typeof window !== 'undefined' && typeof (window as WindowWithSavePicker).showSaveFilePicker === 'function';
     const previewRequestRef = useRef(0);
     const previewUrlRef = useRef<string | null>(null);
+    const downloadProgressRef = useRef<DownloadProgressState>(DOWNLOAD_PROGRESS_INITIAL_STATE);
+    const pendingDownloadProgressRef = useRef<DownloadProgressState | null>(null);
+    const downloadProgressTimerRef = useRef<number | null>(null);
     const visibleFiles = files.filter((file) => {
         if (fileFilter === 'encrypted') {
             return file.encrypted;
@@ -348,6 +370,72 @@ export const FileTransfer = ({
         }
         return true;
     });
+
+    const commitDownloadProgress = useCallback((next: DownloadProgressState, urgent: boolean = false) => {
+        const current = downloadProgressRef.current;
+        if (
+            current.active === next.active
+            && current.fileName === next.fileName
+            && current.stage === next.stage
+            && Math.abs(current.progress - next.progress) < 0.001
+        ) {
+            return;
+        }
+
+        downloadProgressRef.current = next;
+        if (urgent) {
+            setDownloadProgress(next);
+            return;
+        }
+
+        startTransition(() => {
+            setDownloadProgress(next);
+        });
+    }, []);
+
+    const updateDownloadProgress = useCallback((next: DownloadProgressState) => {
+        const current = pendingDownloadProgressRef.current ?? downloadProgressRef.current;
+        const urgent = (
+            next.stage !== current.stage
+            || next.fileName !== current.fileName
+            || next.progress >= 1
+            || !next.active
+        );
+
+        if (
+            !urgent
+            && current.active === next.active
+            && current.fileName === next.fileName
+            && current.stage === next.stage
+            && Math.abs(current.progress - next.progress) < DOWNLOAD_PROGRESS_MIN_STEP
+        ) {
+            return;
+        }
+
+        if (urgent) {
+            pendingDownloadProgressRef.current = null;
+            if (downloadProgressTimerRef.current !== null) {
+                window.clearTimeout(downloadProgressTimerRef.current);
+                downloadProgressTimerRef.current = null;
+            }
+            commitDownloadProgress(next, true);
+            return;
+        }
+
+        pendingDownloadProgressRef.current = next;
+        if (downloadProgressTimerRef.current !== null) {
+            return;
+        }
+
+        downloadProgressTimerRef.current = window.setTimeout(() => {
+            downloadProgressTimerRef.current = null;
+            const pending = pendingDownloadProgressRef.current;
+            pendingDownloadProgressRef.current = null;
+            if (pending) {
+                commitDownloadProgress(pending);
+            }
+        }, DOWNLOAD_PROGRESS_THROTTLE_MS);
+    }, [commitDownloadProgress]);
 
     const replacePreviewUrl = useCallback((nextUrl: string | null) => {
         if (previewUrlRef.current) {
@@ -362,6 +450,9 @@ export const FileTransfer = ({
         if (previewUrlRef.current) {
             URL.revokeObjectURL(previewUrlRef.current);
         }
+        if (downloadProgressTimerRef.current !== null) {
+            window.clearTimeout(downloadProgressTimerRef.current);
+        }
     }, []);
 
     const fetchPlainBlob = useCallback(async (file: FileMetadata): Promise<Blob> => {
@@ -372,12 +463,23 @@ export const FileTransfer = ({
         return response.blob();
     }, [roomId]);
 
+    const getDecryptWorkerCtor = useCallback((file: FileMetadata): DecryptWorkerConstructor => {
+        if (file.encryptionVersion === 'v2') {
+            return DecryptWorkerV2;
+        }
+        return DecryptWorker;
+    }, []);
+
     const fetchAndDecrypt = useCallback(async (
         file: FileMetadata,
         onProgress?: (progress: DownloadProgressState) => void,
     ): Promise<Blob> => {
         if (!file.encrypted) {
             return fetchPlainBlob(file);
+        }
+
+        if (file.encryptionVersion === 'v2' && !isFileCryptoV2Available()) {
+            throw new Error('当前访问环境不支持 v2 加密文件解密');
         }
 
         const response = await fetch(`/download/${roomId}/${file.id}?preview=1`);
@@ -389,10 +491,11 @@ export const FileTransfer = ({
             response,
             roomPassword,
             getMimeType(file.fileName),
+            getDecryptWorkerCtor(file),
             onProgress,
             file.fileName,
         );
-    }, [fetchPlainBlob, roomId, roomPassword]);
+    }, [fetchPlainBlob, getDecryptWorkerCtor, roomId, roomPassword]);
 
     const openPreview = useCallback(async (file: FileMetadata) => {
         const requestId = previewRequestRef.current + 1;
@@ -471,11 +574,11 @@ export const FileTransfer = ({
                 return;
             }
 
-            setDownloadProgress({
+            updateDownloadProgress({
                 active: true,
                 fileName: file.fileName,
                 progress: 0,
-                stage: 'downloading',
+                stage: supportsStreamSave ? 'saving' : 'downloading',
             });
 
             if (supportsStreamSave) {
@@ -498,18 +601,19 @@ export const FileTransfer = ({
                     response,
                     roomPassword,
                     writable,
-                    setDownloadProgress,
+                    getDecryptWorkerCtor(file),
+                    updateDownloadProgress,
                     file.fileName,
                 );
 
-                setDownloadProgress({
+                updateDownloadProgress({
                     active: true,
                     fileName: file.fileName,
                     progress: 1,
                     stage: 'idle',
                 });
                 window.setTimeout(() => {
-                    setDownloadProgress({
+                    updateDownloadProgress({
                         active: false,
                         fileName: '',
                         progress: 0,
@@ -519,7 +623,7 @@ export const FileTransfer = ({
                 return;
             }
 
-            const decryptedBlob = await fetchAndDecrypt(file, setDownloadProgress);
+            const decryptedBlob = await fetchAndDecrypt(file, updateDownloadProgress);
             const url = URL.createObjectURL(decryptedBlob);
 
             const anchor = document.createElement('a');
@@ -529,14 +633,14 @@ export const FileTransfer = ({
             anchor.click();
             document.body.removeChild(anchor);
             URL.revokeObjectURL(url);
-            setDownloadProgress({
+            updateDownloadProgress({
                 active: true,
                 fileName: file.fileName,
                 progress: 1,
                 stage: 'idle',
             });
             window.setTimeout(() => {
-                setDownloadProgress({
+                updateDownloadProgress({
                     active: false,
                     fileName: '',
                     progress: 0,
@@ -544,7 +648,7 @@ export const FileTransfer = ({
                 });
             }, 600);
         } catch (error) {
-            setDownloadProgress({
+            updateDownloadProgress({
                 active: false,
                 fileName: '',
                 progress: 0,
@@ -555,7 +659,7 @@ export const FileTransfer = ({
             }
             alert('文件下载并解密失败');
         }
-    }, [fetchAndDecrypt, roomId, roomPassword, supportsStreamSave]);
+    }, [fetchAndDecrypt, getDecryptWorkerCtor, roomId, roomPassword, supportsStreamSave, updateDownloadProgress]);
 
     const toggleSelectAll = () => {
         const visibleIds = visibleFiles.map((file) => file.id);
@@ -667,7 +771,7 @@ export const FileTransfer = ({
 
                         <button
                             type="button"
-                            onClick={() => setEncryptUploads(true)}
+                            onClick={() => handleSetEncryptUploads(true)}
                             disabled={uploadProgress.active}
                             style={{
                                 padding: '0.45rem 0.7rem',
@@ -682,7 +786,7 @@ export const FileTransfer = ({
                         </button>
                         <button
                             type="button"
-                            onClick={() => setEncryptUploads(false)}
+                            onClick={() => handleSetEncryptUploads(false)}
                             disabled={uploadProgress.active}
                             style={{
                                 padding: '0.45rem 0.7rem',
@@ -945,7 +1049,9 @@ export const FileTransfer = ({
                         {visibleFiles.length === 0 ? (
                             <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.85rem', padding: '1rem' }}>此空间尚无缓存资料。</div>
                         ) : (
-                            visibleFiles.map((file) => (
+                            visibleFiles.map((file) => {
+                                const metadataLocked = isLockedMetadataFile(file);
+                                return (
                                 <div key={file.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0.75rem', background: 'var(--panel-bg)', border: '1px solid var(--panel-border)', borderRadius: '8px', marginBottom: '0.5rem' }}>
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', overflow: 'hidden' }}>
                                         <div onClick={() => toggleSelect(file.id)} style={{ cursor: 'pointer', color: selectedIds.has(file.id) ? '#3b82f6' : 'var(--text-muted)', display: 'flex', alignItems: 'center' }}>
@@ -974,11 +1080,30 @@ export const FileTransfer = ({
                                                 }}>
                                                     {file.encrypted ? '已加密' : '未加密'}
                                                 </span>
+                                                {metadataLocked && (
+                                                    <span style={{
+                                                        fontSize: '0.65rem',
+                                                        lineHeight: 1,
+                                                        padding: '0.22rem 0.38rem',
+                                                        borderRadius: '999px',
+                                                        border: '1px solid rgba(245, 158, 11, 0.28)',
+                                                        background: 'rgba(245, 158, 11, 0.1)',
+                                                        color: '#fcd34d',
+                                                        whiteSpace: 'nowrap',
+                                                    }}>
+                                                        文件名未解锁
+                                                    </span>
+                                                )}
                                             </div>
+                                            {metadataLocked && (
+                                                <span style={{ marginTop: '0.3rem', fontSize: '0.68rem', color: '#fbbf24' }}>
+                                                    文件内容仍可下载，但当前环境无法恢复原始文件名。
+                                                </span>
+                                            )}
                                         </div>
                                     </div>
                                     <div style={{ display: 'flex', gap: '0.5rem' }}>
-                                        {canPreview(file.fileName) && (
+                                        {!metadataLocked && canPreview(file.fileName) && (
                                             <button onClick={() => void openPreview(file)} style={{ padding: '0.4rem', background: 'rgba(139, 92, 246, 0.1)', color: '#8b5cf6', border: 'none', borderRadius: '6px', cursor: 'pointer' }} title="预览文件">
                                                 <Eye size={16} />
                                             </button>
@@ -991,7 +1116,8 @@ export const FileTransfer = ({
                                         </button>
                                     </div>
                                 </div>
-                            ))
+                            );
+                            })
                         )}
                     </div>
                 </div>

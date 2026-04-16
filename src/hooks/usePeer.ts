@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import EncryptWorker from '../workers/encryptWorker?worker';
-import type { FileMetadata, SysMessage, TextMessage } from '../types';
+import EncryptWorkerV2 from '../workers/encryptWorkerV2?worker';
+import type {
+    EncryptedFileMetadataPayloadV2,
+    FileMetadata,
+    SerializedFileMetadata,
+    SysMessage,
+    TextMessage,
+} from '../types';
 import {
     clearKeyCache,
     decryptText,
@@ -9,11 +16,28 @@ import {
     encryptText,
     hashRoomPassword,
 } from '../utils/cryptoUtils';
+import {
+    clearMessageKeyCacheV2,
+    decryptTextV2,
+    encryptTextV2,
+    isMessageCryptoV2Available,
+} from '../utils/messageCryptoV2';
+import { isFileCryptoV2Available } from '../utils/fileCryptoV2';
+import {
+    clearMetadataKeyCacheV2,
+    decryptFileMetadataV2,
+    encryptFileMetadataV2,
+    isMetadataCryptoV2Available,
+} from '../utils/metadataCryptoV2';
 
 type RoomMessage = TextMessage | SysMessage;
 type RoomHistoryPayload = {
     messages: RoomMessage[];
-    files: FileMetadata[];
+    files: SerializedFileMetadata[];
+};
+type RoomCapabilities = {
+    messageCryptoV2Enabled: boolean;
+    fileCryptoV2Enabled: boolean;
 };
 
 type EncryptWorkerResponse =
@@ -24,10 +48,64 @@ type EncryptWorkerResponse =
 
 const CHUNK_SIZE = 4 * 1024 * 1024;
 const MAX_RETRIES = 3;
-const ENCRYPTION_SALT = 'FT-NET-SECURE-SALT-2024';
+const V1_ENCRYPTION_SALT = 'FT-NET-SECURE-SALT-2024';
+const UNKNOWN_FILE_NAME = 'unnamed-file';
+const LOCKED_FILE_NAME = '[encrypted file name unavailable]';
 
 const getErrorMessage = (error: unknown): string => (
     error instanceof Error ? error.message : 'Unknown error'
+);
+
+const normalizeFileName = (value: unknown): string => (
+    typeof value === 'string' && value.trim() ? value.trim() : UNKNOWN_FILE_NAME
+);
+
+const hydrateIncomingFile = async (
+    file: SerializedFileMetadata,
+    roomPasswordValue: string | null,
+): Promise<FileMetadata> => {
+    if (file.encryptedMetadata?.version === 'v2') {
+        if (!roomPasswordValue || !isMetadataCryptoV2Available()) {
+            return {
+                ...file,
+                fileName: LOCKED_FILE_NAME,
+                metadataState: 'locked',
+            };
+        }
+
+        try {
+            const decryptedMetadata = await decryptFileMetadataV2(
+                file.encryptedMetadata,
+                roomPasswordValue,
+            );
+
+            return {
+                ...file,
+                fileName: decryptedMetadata.fileName,
+                metadataState: 'decrypted',
+            };
+        } catch (error) {
+            console.error('Failed to decrypt file metadata:', error);
+            return {
+                ...file,
+                fileName: LOCKED_FILE_NAME,
+                metadataState: 'locked',
+            };
+        }
+    }
+
+    return {
+        ...file,
+        fileName: normalizeFileName(file.fileName),
+        metadataState: 'plain',
+    };
+};
+
+const hydrateIncomingFiles = (
+    files: SerializedFileMetadata[],
+    roomPasswordValue: string | null,
+): Promise<FileMetadata[]> => Promise.all(
+    files.map((file) => hydrateIncomingFile(file, roomPasswordValue)),
 );
 
 const generateShortId = () => {
@@ -43,6 +121,10 @@ export const usePeer = () => {
     const [messages, setMessages] = useState<RoomMessage[]>([]);
     const [files, setFiles] = useState<FileMetadata[]>([]);
     const [onlineCount, setOnlineCount] = useState(0);
+    const [roomCapabilities, setRoomCapabilities] = useState<RoomCapabilities>({
+        messageCryptoV2Enabled: false,
+        fileCryptoV2Enabled: false,
+    });
     const [uploadProgress, setUploadProgress] = useState<{
         progress: number;
         active: boolean;
@@ -50,6 +132,7 @@ export const usePeer = () => {
     }>({ progress: 0, active: false, stage: 'idle' });
 
     const socketRef = useRef<Socket | null>(null);
+    const roomPasswordRef = useRef<string | null>(null);
     const encryptionKeyRef = useRef<string | null>(null);
     const xhrRef = useRef<XMLHttpRequest | null>(null);
     const workerRef = useRef<Worker | null>(null);
@@ -57,15 +140,47 @@ export const usePeer = () => {
     const uploadSessionRef = useRef<{ roomId: string; uploadId: string } | null>(null);
 
     useEffect(() => {
+        roomPasswordRef.current = roomPassword;
+    }, [roomPassword]);
+
+    useEffect(() => {
         encryptionKeyRef.current = encryptionKey;
     }, [encryptionKey]);
 
-    const decryptIncomingMessage = (message: RoomMessage, key: string): RoomMessage => {
+    const decryptIncomingMessage = async (
+        message: RoomMessage,
+        roomPasswordValue: string | null,
+        legacyKey: string | null,
+    ): Promise<RoomMessage> => {
         if (message.type === 'TEXT' && message.isEncrypted) {
             try {
+                if (message.version === 'v2') {
+                    if (!message.payload || !roomPasswordValue || !isMessageCryptoV2Available()) {
+                        return {
+                            ...message,
+                            content: '[当前环境无法解密 v2 消息]',
+                            isEncrypted: false,
+                        };
+                    }
+
+                    return {
+                        ...message,
+                        content: await decryptTextV2(message.payload, roomPasswordValue),
+                        isEncrypted: false,
+                    };
+                }
+
+                if (!legacyKey) {
+                    return {
+                        ...message,
+                        content: '[当前环境无法解密历史消息]',
+                        isEncrypted: false,
+                    };
+                }
+
                 return {
                     ...message,
-                    content: decryptText(message.content, key),
+                    content: decryptText(message.content, legacyKey),
                     isEncrypted: false,
                 };
             } catch (error) {
@@ -156,12 +271,17 @@ export const usePeer = () => {
 
         socket.on('room_history', (data: RoomHistoryPayload) => {
             const currentKey = encryptionKeyRef.current;
-            if (currentKey) {
-                setMessages(data.messages.map((message) => decryptIncomingMessage(message, currentKey)));
-            } else {
-                setMessages(data.messages);
-            }
-            setFiles(data.files);
+            const currentPassword = roomPasswordRef.current;
+
+            void Promise.all(
+                data.messages.map((message) => decryptIncomingMessage(message, currentPassword, currentKey)),
+            ).then((decryptedMessages) => {
+                setMessages(decryptedMessages);
+            });
+
+            void hydrateIncomingFiles(data.files, currentPassword).then((nextFiles) => {
+                setFiles(nextFiles);
+            });
         });
 
         socket.on('sys_message', (message: SysMessage) => {
@@ -170,20 +290,33 @@ export const usePeer = () => {
 
         socket.on('new_message', (message: TextMessage) => {
             const currentKey = encryptionKeyRef.current;
-            const nextMessage = currentKey ? decryptIncomingMessage(message, currentKey) : message;
-            setMessages((prev) => [...prev, { ...nextMessage, sender: 'remote' }]);
+            const currentPassword = roomPasswordRef.current;
+
+            void decryptIncomingMessage(message, currentPassword, currentKey).then((nextMessage) => {
+                setMessages((prev) => [...prev, { ...nextMessage, sender: 'remote' }]);
+            });
         });
 
-        socket.on('file-added', (file: FileMetadata) => {
-            setFiles((prev) => [...prev, file]);
+        socket.on('file-added', (file: SerializedFileMetadata) => {
+            const currentPassword = roomPasswordRef.current;
+            void hydrateIncomingFile(file, currentPassword).then((nextFile) => {
+                setFiles((prev) => [...prev, nextFile]);
+            });
         });
 
-        socket.on('files-updated', (updatedFiles: FileMetadata[]) => {
-            setFiles(updatedFiles);
+        socket.on('files-updated', (updatedFiles: SerializedFileMetadata[]) => {
+            const currentPassword = roomPasswordRef.current;
+            void hydrateIncomingFiles(updatedFiles, currentPassword).then((nextFiles) => {
+                setFiles(nextFiles);
+            });
         });
 
         socket.on('user_count', (count: number) => {
             setOnlineCount(count);
+        });
+
+        socket.on('room_capabilities', (capabilities: RoomCapabilities) => {
+            setRoomCapabilities(capabilities);
         });
 
         return () => {
@@ -201,7 +334,7 @@ export const usePeer = () => {
             await fetch(`/delete-files/${targetRoomId}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ fileIds }),
+                body: JSON.stringify({ fileIds, senderId: peerId }),
             });
         } catch (error) {
             console.error('Failed to delete files:', error);
@@ -217,6 +350,7 @@ export const usePeer = () => {
             const nextEncryptionKey = deriveEncryptionKey(password);
             const nextHashedRoomId = hashRoomPassword(password);
 
+            roomPasswordRef.current = password;
             encryptionKeyRef.current = nextEncryptionKey;
             setEncryptionKey(nextEncryptionKey);
             setHashedRoomId(nextHashedRoomId);
@@ -224,9 +358,25 @@ export const usePeer = () => {
             setMessages([]);
             setFiles([]);
             setOnlineCount(0);
+            setRoomCapabilities({
+                messageCryptoV2Enabled: false,
+                fileCryptoV2Enabled: false,
+            });
 
             socketRef.current.connect();
-            socketRef.current.emit('join_room', { roomId: nextHashedRoomId, senderId: peerId });
+            socketRef.current.emit('join_room', {
+                roomId: nextHashedRoomId,
+                senderId: peerId,
+                capabilities: {
+                    webCryptoV2: isMessageCryptoV2Available(),
+                },
+            });
+
+            if (isMessageCryptoV2Available()) {
+                void import('../utils/messageCryptoV2').then(m => m.encryptTextV2('', password).catch(() => {}));
+                void import('../utils/fileCryptoV2').then(m => m.deriveFileKeyV2(password).catch(() => {}));
+                void import('../utils/metadataCryptoV2').then(m => m.deriveMetadataKeyV2(password).catch(() => {}));
+            }
         } catch (error) {
             console.error('E2EE initialization failed:', error);
             alert('Failed to initialize the encrypted room.');
@@ -240,7 +390,10 @@ export const usePeer = () => {
 
         abortActiveUpload();
         clearKeyCache(roomPassword ?? undefined);
+        clearMessageKeyCacheV2(roomPassword ?? undefined);
+        clearMetadataKeyCacheV2(roomPassword ?? undefined);
         socketRef.current.disconnect();
+        roomPasswordRef.current = null;
         encryptionKeyRef.current = null;
 
         setRoomPassword(null);
@@ -249,37 +402,72 @@ export const usePeer = () => {
         setMessages([]);
         setFiles([]);
         setOnlineCount(0);
+        setRoomCapabilities({
+            messageCryptoV2Enabled: false,
+            fileCryptoV2Enabled: false,
+        });
     };
 
-    const sendText = (text: string) => {
+    const sendText = async (text: string) => {
         if (!socketRef.current || !roomPassword || !encryptionKey) {
             return;
         }
 
-        const encryptedContent = encryptText(text, encryptionKey);
-        const message: TextMessage = {
-            type: 'TEXT',
-            content: encryptedContent,
-            sender: 'me',
-            senderName: peerId,
-            timestamp: Date.now(),
-            isEncrypted: true,
-        };
+        const useV2 = roomCapabilities.messageCryptoV2Enabled && isMessageCryptoV2Available();
+
+        const message: TextMessage = useV2
+            ? {
+                type: 'TEXT',
+                content: '',
+                sender: 'me',
+                senderName: peerId,
+                timestamp: Date.now(),
+                isEncrypted: true,
+                version: 'v2',
+                securityMode: 'encrypted',
+                algorithm: 'AES-GCM',
+                payload: await encryptTextV2(text, roomPassword),
+            }
+            : {
+                type: 'TEXT',
+                content: encryptText(text, encryptionKey),
+                sender: 'me',
+                senderName: peerId,
+                timestamp: Date.now(),
+                isEncrypted: true,
+                version: 'v1',
+                securityMode: 'encrypted',
+                algorithm: 'AES-CBC',
+            };
 
         setMessages((prev) => [...prev, { ...message, content: text, isEncrypted: false }]);
         socketRef.current.emit('send_message', { ...message, sender: 'remote' });
     };
 
-    const createUploadSession = async (roomId: string, file: File, encrypted: boolean): Promise<string> => {
+    const createUploadSession = async (
+        roomId: string,
+        file: File,
+        encrypted: boolean,
+        metadata: {
+            fileName?: string;
+            encryptedMetadata?: EncryptedFileMetadataPayloadV2;
+        },
+        encryptionVersion?: 'v1' | 'v2',
+        algorithm?: 'AES-CBC' | 'AES-GCM',
+    ): Promise<string> => {
         const response = await fetch(`/upload/init/${roomId}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                fileName: file.name,
+                fileName: metadata.fileName,
+                encryptedMetadata: metadata.encryptedMetadata,
                 fileSize: file.size,
                 fileType: file.type,
                 senderId: peerId,
                 encrypted,
+                securityMode: encrypted ? 'encrypted' : 'plain',
+                encryptionVersion,
+                algorithm,
             }),
         });
 
@@ -405,26 +593,50 @@ export const usePeer = () => {
         }
 
         const targetRoomId = hashedRoomId ?? hashRoomPassword(roomPassword);
+        const useFileCryptoV2 = encrypted
+            && roomCapabilities.fileCryptoV2Enabled
+            && isFileCryptoV2Available();
+        const useMetadataCryptoV2 = encrypted
+            && roomCapabilities.fileCryptoV2Enabled
+            && isMetadataCryptoV2Available();
         let uploadId: string | null = null;
         let worker: Worker | null = null;
 
         try {
             setUploadProgress({ progress: 0, active: true, stage: encrypted ? 'encrypting' : 'streaming' });
 
-            uploadId = await createUploadSession(targetRoomId, file, encrypted);
+            const metadata = useMetadataCryptoV2
+                ? {
+                    encryptedMetadata: await encryptFileMetadataV2(
+                        { fileName: file.name },
+                        roomPassword,
+                    ),
+                }
+                : {
+                    fileName: file.name,
+                };
+
+            uploadId = await createUploadSession(
+                targetRoomId,
+                file,
+                encrypted,
+                metadata,
+                encrypted ? (useFileCryptoV2 ? 'v2' : 'v1') : undefined,
+                encrypted ? (useFileCryptoV2 ? 'AES-GCM' : 'AES-CBC') : undefined,
+            );
             uploadSessionRef.current = { roomId: targetRoomId, uploadId };
 
             let chunkIndex = 0;
             let uploadedPlainBytes = 0;
 
             if (encrypted) {
-                worker = new EncryptWorker();
+                worker = useFileCryptoV2 ? new EncryptWorkerV2() : new EncryptWorker();
                 workerRef.current = worker;
 
                 const headerResponse = await sendWorkerMessage(worker, {
                     type: 'INIT',
                     key: roomPassword,
-                    salt: ENCRYPTION_SALT,
+                    salt: V1_ENCRYPTION_SALT,
                     iterations: 1000,
                 });
 

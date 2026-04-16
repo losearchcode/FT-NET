@@ -1,4 +1,21 @@
 export type MessageType = 'TEXT' | 'SYS_MSG';
+export type MessageVersion = 'v1' | 'v2';
+export type MessageSecurityMode = 'encrypted' | 'plain';
+
+export interface EncryptedTextPayloadV2 {
+  iv: string;
+  ciphertext: string;
+}
+
+export interface EncryptedFileMetadataPayloadV2 {
+  version: 'v2';
+  iv: string;
+  ciphertext: string;
+}
+
+export interface FileMetadataSecretV2 {
+  fileName: string;
+}
 
 export interface BaseMessage {
   type: MessageType;
@@ -12,6 +29,10 @@ export interface TextMessage extends BaseMessage {
   type: 'TEXT';
   content: string;
   isEncrypted?: boolean;
+  version?: MessageVersion;
+  securityMode?: MessageSecurityMode;
+  algorithm?: 'AES-CBC' | 'AES-GCM';
+  payload?: EncryptedTextPayloadV2;
 }
 
 export interface SysMessage extends BaseMessage {
@@ -21,12 +42,21 @@ export interface SysMessage extends BaseMessage {
 
 export type P2PMessage = TextMessage | SysMessage;
 
-export interface FileMetadata {
+export interface SerializedFileMetadata {
   id: string;
-  fileName: string;
+  fileName?: string;
   fileSize: number;
   fileType: string;
   uploadedAt: number;
   senderId: string;
   encrypted: boolean;
+  securityMode?: MessageSecurityMode;
+  encryptionVersion?: MessageVersion;
+  algorithm?: 'AES-CBC' | 'AES-GCM';
+  encryptedMetadata?: EncryptedFileMetadataPayloadV2;
+}
+
+export interface FileMetadata extends SerializedFileMetadata {
+  fileName: string;
+  metadataState?: 'plain' | 'decrypted' | 'locked';
 }

@@ -32,6 +32,8 @@
 | 🛡️ **大文件稳传** | 移除 Node.js 默认超时限制 + 前端自动重试机制，支持 GB 级文件稳定传输 |
 | 🚚 **分块上传降压** | 上传端按分片加密/上传，服务端顺序落盘，避免大文件“整份加密后再整份上传”带来的高内存占用 |
 | 🔐 **可选上传模式** | 支持“端到端加密上传 / 明文直传”两种模式，兼顾隐私保护与性能较弱设备的可用性 |
+| 🧩 **E2EE v2 双栈兼容** | 新消息与新加密文件已接入 `Web Crypto API + PBKDF2 + HKDF + AES-GCM`，同时保留 `v1 / v2` 双读兼容 |
+| 🧾 **文件名元数据加密** | 加密文件的 `fileName` 会以 `encryptedMetadata` 形式存储，服务端不再直接暴露原始文件名 |
 | 💽 **下载能力分流** | 支持流式保存的浏览器可边下载边写入本地文件；不支持时自动回退并提示内存占用风险 |
 | 🎨 **现代暗黑 UI** | Glassmorphism 毛玻璃设计 + 聊天气泡 + 响应式自适应滑窗布局 |
 | 👁️ **文件快捷预览** | 图片/PDF/文本代码文件（txt/md/json/csv/js/py 等 30+ 格式）无需下载即可在线预览 |
@@ -117,16 +119,22 @@ FT-NET/
 │   └── index.js            # Node.js 服务端（房间管理 + 分块上传 + 文件存储 + 静态托管）
 ├── src/
 │   ├── hooks/
-│   │   └── usePeer.ts      # 核心通讯 Hook（Socket.IO + 分块上传 + 房间状态）
+│   │   └── usePeer.ts      # 核心通讯 Hook（Socket.IO + v1/v2 双栈加密 + 分块上传 + 元数据解密）
 │   ├── components/
 │   │   ├── ConnectionPanel.tsx   # 密码大厅入口
 │   │   ├── ChatBox.tsx           # 群组通讯录
-│   │   └── FileTransfer.tsx      # 公共存储柜（上传模式切换 / 预览 / 下载分流）
+│   │   └── FileTransfer.tsx      # 公共存储柜（上传模式切换 / 元数据锁定态提示 / 预览 / 下载分流）
 │   ├── utils/
-│   │   └── cryptoUtils.ts # 文本与文件加解密工具
+│   │   ├── cryptoUtils.ts        # 历史 v1 文本与文件加解密工具
+│   │   ├── e2eeV2.ts            # E2EE v2 公共派生与编码工具
+│   │   ├── messageCryptoV2.ts   # 文本消息 v2 加解密
+│   │   ├── fileCryptoV2.ts      # 文件内容 v2 分片加解密工具
+│   │   └── metadataCryptoV2.ts  # 文件元数据 v2 加解密工具
 │   ├── workers/
-│   │   ├── encryptWorker.ts # 分块加密 Worker
-│   │   └── decryptWorker.ts # 分块解密 Worker
+│   │   ├── encryptWorker.ts     # 历史 v1 分块加密 Worker
+│   │   ├── decryptWorker.ts     # 历史 v1 分块解密 Worker
+│   │   ├── encryptWorkerV2.ts   # 文件内容 v2 分块加密 Worker
+│   │   └── decryptWorkerV2.ts   # 文件内容 v2 分块解密 Worker
 │   ├── types.ts            # TypeScript 类型定义
 │   ├── App.tsx             # 主应用组件
 │   ├── index.css           # 全局样式系统
@@ -134,7 +142,8 @@ FT-NET/
 ├── Doc/
 │   ├── User_Manual.md      # 使用手册
 │   ├── Deployment_Guide.md # 服务器部署指南
-│   └── Encryption_Plan.md  # 端到端加密规划
+│   ├── Encryption_Plan.md  # 端到端加密规划
+│   └── E2EE_V2_Technical_Design.md # E2EE v2 技术草案
 └── dist/                   # 编译产物（由 npm run build 生成）
 ```
 
@@ -171,6 +180,12 @@ location / {
 ---
 
 ## 📋 更新日志
+
+### v1.6.0 — E2EE v2 元数据加密与协议收口
+- 🧩 **E2EE v2 双栈落地**：新消息与新加密文件已统一接入 `Web Crypto API + PBKDF2 + HKDF + AES-GCM`，并保留 `v1 / v2` 双读兼容能力
+- 🧾 **文件元数据加密**：加密上传时会将 `fileName` 封装为 `encryptedMetadata` 存储，服务端物理文件名改为随机 `id`，进一步降低明文暴露面
+- 🗂️ **文件列表自动解密展示**：客户端在接收房间历史、`file-added`、`files-updated` 时会自动解密文件名；若环境不支持或无法解密，则显示“文件名未解锁”状态并保留文件内容下载能力
+- 📘 **技术文档补全**：新增 [`Doc/E2EE_V2_Technical_Design.md`](Doc/E2EE_V2_Technical_Design.md)，明确消息 v2、文件内容 v2、元数据加密与恢复能力增强的推进顺序
 
 ### v1.5.0 — 分块上传、可选加密与低内存下载
 - 🚚 **分块上传与顺序落盘**：上传端改为分片处理，服务端通过 `init / chunk / complete / abort` 协议顺序写盘，显著降低大文件上传时的浏览器内存压力
@@ -211,11 +226,12 @@ location / {
 
 ## 🔮 To-do
 
-- [ ] **完善端到端加密 (E2EE)**：当前已支持文本消息加密与文件可选加密上传，后续继续完善统一密钥管理、下载体验与安全策略（详见 [`Doc/Encryption_Plan.md`](Doc/Encryption_Plan.md)）
+- [ ] **完善端到端加密 (E2EE)**：当前已支持消息 `v2`、文件内容 `v2`、文件名元数据加密与锁定态提示，后续继续完善统一密钥策略、恢复能力与 UI 安全提示（详见 [`Doc/E2EE_V2_Technical_Design.md`](Doc/E2EE_V2_Technical_Design.md) 与 [`Doc/Encryption_Plan.md`](Doc/Encryption_Plan.md)）
 - [ ] HTTPS / WSS 传输层加密
 - [ ] 上传模式偏好记忆（记住上次选择“加密上传”或“明文直传”）
 - [ ] 下载恢复 / 断点续传
 - [ ] 更细粒度的大文件传输校验与异常恢复
+- [x] ~~文件名元数据加密（`encryptedMetadata`）~~
 - [x] ~~房间在线人数实时显示~~
 - [x] ~~文件预览（图片/PDF）~~
 - [x] ~~拖拽多文件批量上传~~

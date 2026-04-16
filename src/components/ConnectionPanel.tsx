@@ -75,6 +75,11 @@ export const ConnectionPanel: React.FC<RoomLoginPanelProps> = ({ peerId, roomPas
                                 value={passwordInput}
                                 onChange={(e) => setPasswordInput(e.target.value)}
                             />
+                            {passwordInput && passwordInput.length < 6 && (
+                                <div style={{ color: '#f59e0b', fontSize: '0.75rem', marginTop: '0.5rem', fontWeight: 500 }}>
+                                    ⚠️ 密码过短，加密强度较低，建议使用 6 位以上密码
+                                </div>
+                            )}
                         </div>
                         <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', lineHeight: '1.4' }}>
                             * 您将进入对应密码的公共空间。如果房间不存在将自动创立。当房间内人员全部退出后，存储的数据和历史记录将被永久销毁。
