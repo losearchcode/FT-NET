@@ -5,6 +5,8 @@ export type MessageSecurityMode = 'encrypted' | 'plain';
 export interface EncryptedTextPayloadV2 {
   iv: string;
   ciphertext: string;
+  encryptedSenderName?: string;   // base64, AES-GCM 加密后的发送者名称
+  senderNameIv?: string;          // base64, senderName 加密用的独立 IV
 }
 
 export interface EncryptedFileMetadataPayloadV2 {
@@ -59,4 +61,9 @@ export interface SerializedFileMetadata {
 export interface FileMetadata extends SerializedFileMetadata {
   fileName: string;
   metadataState?: 'plain' | 'decrypted' | 'locked';
+}
+
+export interface RoomCapabilities {
+  messageCryptoV2Enabled: boolean;
+  fileCryptoV2Enabled: boolean;
 }

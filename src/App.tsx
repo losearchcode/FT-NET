@@ -7,12 +7,14 @@ import { FileTransfer } from './components/FileTransfer';
 function App() {
   const {
     peerId,
+    refreshPeerId,
     roomPassword,
     hashedRoomId,
     encryptionKey,
     messages,
     files,
     onlineCount,
+    roomCapabilities,
     uploadProgress,
     joinRoom,
     leaveRoom,
@@ -33,10 +35,13 @@ function App() {
     <div className="app-container">
       <ConnectionPanel
         peerId={peerId}
+        onRefreshPeerId={refreshPeerId}
         roomPassword={roomPassword}
         onlineCount={onlineCount}
         onJoin={joinRoom}
         onLeave={leaveRoom}
+        roomCapabilities={roomCapabilities}
+        supportsStreamSave={typeof (window as any).showSaveFilePicker === 'function'}
       />
 
       <div className="main-content" ref={mainContentRef}>
@@ -50,11 +55,13 @@ function App() {
               onDeleteFiles={deleteFiles}
               roomId={hashedRoomId}
               roomPassword={roomPassword}
+              roomCapabilities={roomCapabilities}
             />
             <ChatBox
               messages={messages}
               onSendMessage={sendText}
               myId={peerId}
+              roomCapabilities={roomCapabilities}
             />
           </>
         ) : (

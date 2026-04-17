@@ -117,6 +117,7 @@ app.post('/upload/init/:roomId', (req, res) => {
         securityMode,
         encryptionVersion,
         algorithm,
+        resumeId,
     } = req.body ?? {};
 
     const room = rooms.get(roomId);
@@ -133,9 +134,18 @@ app.post('/upload/init/:roomId', (req, res) => {
         return res.status(400).send('Invalid upload metadata.');
     }
 
+    if (resumeId && uploadSessions.has(resumeId)) {
+        const session = uploadSessions.get(resumeId);
+        return res.json({
+            success: true,
+            uploadId: resumeId,
+            nextChunkIndex: session.nextChunkIndex,
+        });
+    }
+
     const roomDir = ensureRoomDir(roomId);
     const storedFileId = makeId();
-    const uploadId = makeId();
+    const uploadId = resumeId || makeId();
     const tempFilePath = path.join(roomDir, `${storedFileId}.part.${uploadId}`);
 
     fs.writeFileSync(tempFilePath, Buffer.alloc(0));
@@ -356,11 +366,17 @@ io.on('connection', (socket) => {
         socket.senderId = senderId;
 
         if (!rooms.has(roomId)) {
-            rooms.set(roomId, { messages: [], files: [], users: new Map() });
+            rooms.set(roomId, { messages: [], files: [], users: new Map(), destructionTimeout: null });
             console.log(`Room [${roomId}] dynamically created by ${senderId}`);
         }
 
         const room = rooms.get(roomId);
+        if (room.destructionTimeout) {
+            clearTimeout(room.destructionTimeout);
+            room.destructionTimeout = null;
+            console.log(`Room [${roomId}] destruction aborted (user rejoined).`);
+        }
+        
         room.users.set(socket.id, {
             senderId,
             webCryptoV2: Boolean(capabilities.webCryptoV2),
@@ -409,17 +425,22 @@ io.on('connection', (socket) => {
         io.to(socket.roomId).emit('room_capabilities', getRoomCapabilities(room));
 
         if (room.users.size === 0) {
-            rooms.delete(socket.roomId);
-            cleanupRoomUploadSessions(socket.roomId);
-            const roomDir = path.join(UPLOADS_DIR, socket.roomId);
+            console.log(`Room [${socket.roomId}] is empty. Scheduling destruction in 45 seconds...`);
+            room.destructionTimeout = setTimeout(() => {
+                if (rooms.has(socket.roomId)) {
+                    rooms.delete(socket.roomId);
+                    cleanupRoomUploadSessions(socket.roomId);
+                    const roomDir = path.join(UPLOADS_DIR, socket.roomId);
 
-            fs.rm(roomDir, { recursive: true, force: true }, (error) => {
-                if (error && error.code !== 'ENOENT') {
-                    console.error(`Failed to delete room files for [${socket.roomId}]`, error);
-                } else {
-                    console.log(`Room [${socket.roomId}] is now empty. All data and files were destroyed.`);
+                    fs.rm(roomDir, { recursive: true, force: true }, (error) => {
+                        if (error && error.code !== 'ENOENT') {
+                            console.error(`Failed to delete room files for [${socket.roomId}]`, error);
+                        } else {
+                            console.log(`Room [${socket.roomId}] is now empty. All data and files were destroyed.`);
+                        }
+                    });
                 }
-            });
+            }, 45000);
         }
     });
 });

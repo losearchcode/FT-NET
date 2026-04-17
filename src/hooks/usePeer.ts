@@ -8,6 +8,7 @@ import type {
     SerializedFileMetadata,
     SysMessage,
     TextMessage,
+    RoomCapabilities,
 } from '../types';
 import {
     clearKeyCache,
@@ -20,6 +21,8 @@ import {
     clearMessageKeyCacheV2,
     decryptTextV2,
     encryptTextV2,
+    encryptSenderNameV2,
+    decryptSenderNameV2,
     isMessageCryptoV2Available,
 } from '../utils/messageCryptoV2';
 import { isFileCryptoV2Available } from '../utils/fileCryptoV2';
@@ -34,10 +37,6 @@ type RoomMessage = TextMessage | SysMessage;
 type RoomHistoryPayload = {
     messages: RoomMessage[];
     files: SerializedFileMetadata[];
-};
-type RoomCapabilities = {
-    messageCryptoV2Enabled: boolean;
-    fileCryptoV2Enabled: boolean;
 };
 
 type EncryptWorkerResponse =
@@ -113,8 +112,42 @@ const generateShortId = () => {
     return Array.from({ length: 6 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
 };
 
+const generateResumeId = async (file: File): Promise<string | null> => {
+    const rawString = `${file.name}-${file.size}-${file.lastModified}`;
+    if (globalThis.crypto?.subtle) {
+        try {
+            const encoder = new TextEncoder();
+            const data = encoder.encode(rawString);
+            const hash = await globalThis.crypto.subtle.digest('SHA-256', data);
+            return Array.from(new Uint8Array(hash))
+                .map((b) => b.toString(16).padStart(2, '0'))
+                .join('')
+                .slice(0, 32);
+        } catch {
+            // fallback below
+        }
+    }
+    
+    let hash = 0;
+    for (let i = 0; i < rawString.length; i++) {
+        const char = rawString.charCodeAt(i);
+        hash = ((hash << 5) - hash) + char;
+        hash = hash & hash;
+    }
+    const hex = Math.abs(hash).toString(16);
+    return 'fb-' + hex.padStart(8, '0') + '-' + file.size.toString(16);
+};
+
 export const usePeer = () => {
-    const [peerId] = useState(generateShortId);
+    const [peerId, setPeerId] = useState(() => {
+        const savedId = localStorage.getItem('ftnet_peer_id');
+        if (savedId) {
+            return savedId;
+        }
+        const newId = generateShortId();
+        localStorage.setItem('ftnet_peer_id', newId);
+        return newId;
+    });
     const [roomPassword, setRoomPassword] = useState<string | null>(null);
     const [hashedRoomId, setHashedRoomId] = useState<string | null>(null);
     const [encryptionKey, setEncryptionKey] = useState<string | null>(null);
@@ -128,7 +161,8 @@ export const usePeer = () => {
     const [uploadProgress, setUploadProgress] = useState<{
         progress: number;
         active: boolean;
-        stage: 'encrypting' | 'streaming' | 'idle';
+        stage: 'encrypting' | 'streaming' | 'idle' | 'error';
+        error?: string;
     }>({ progress: 0, active: false, stage: 'idle' });
 
     const socketRef = useRef<Socket | null>(null);
@@ -163,9 +197,23 @@ export const usePeer = () => {
                         };
                     }
 
+                    const decryptedContent = await decryptTextV2(message.payload, roomPasswordValue);
+                    let decryptedSenderName = message.senderName;
+                    if (message.payload.encryptedSenderName && message.payload.senderNameIv) {
+                        try {
+                            decryptedSenderName = await decryptSenderNameV2(
+                                message.payload.encryptedSenderName,
+                                message.payload.senderNameIv,
+                                roomPasswordValue,
+                            );
+                        } catch {
+                            // 兼容老消息或解密失败，回退明文 senderName
+                        }
+                    }
                     return {
                         ...message,
-                        content: await decryptTextV2(message.payload, roomPasswordValue),
+                        content: decryptedContent,
+                        senderName: decryptedSenderName,
                         isEncrypted: false,
                     };
                 }
@@ -185,9 +233,13 @@ export const usePeer = () => {
                 };
             } catch (error) {
                 console.error('Failed to decrypt message:', error);
+                const isIntegrityError = (error instanceof DOMException && error.name === 'OperationError')
+                    || (error instanceof Error && error.message.includes('integrity'));
                 return {
                     ...message,
-                    content: '[Unable to decrypt message]',
+                    content: isIntegrityError
+                        ? '[⚠️ 消息完整性校验失败，数据可能已损坏]'
+                        : '[Unable to decrypt message]',
                     isEncrypted: false,
                 };
             }
@@ -341,6 +393,12 @@ export const usePeer = () => {
         }
     };
 
+    const refreshPeerId = () => {
+        const newId = generateShortId();
+        localStorage.setItem('ftnet_peer_id', newId);
+        setPeerId(newId);
+    };
+
     const joinRoom = async (password: string) => {
         if (!socketRef.current) {
             return;
@@ -415,8 +473,10 @@ export const usePeer = () => {
 
         const useV2 = roomCapabilities.messageCryptoV2Enabled && isMessageCryptoV2Available();
 
-        const message: TextMessage = useV2
-            ? {
+        let message: TextMessage;
+        if (useV2) {
+            const encryptedName = await encryptSenderNameV2(peerId, roomPassword);
+            message = {
                 type: 'TEXT',
                 content: '',
                 sender: 'me',
@@ -426,9 +486,14 @@ export const usePeer = () => {
                 version: 'v2',
                 securityMode: 'encrypted',
                 algorithm: 'AES-GCM',
-                payload: await encryptTextV2(text, roomPassword),
-            }
-            : {
+                payload: {
+                    ...(await encryptTextV2(text, roomPassword)),
+                    encryptedSenderName: encryptedName.encryptedSenderName,
+                    senderNameIv: encryptedName.senderNameIv,
+                },
+            };
+        } else {
+            message = {
                 type: 'TEXT',
                 content: encryptText(text, encryptionKey),
                 sender: 'me',
@@ -439,6 +504,7 @@ export const usePeer = () => {
                 securityMode: 'encrypted',
                 algorithm: 'AES-CBC',
             };
+        }
 
         setMessages((prev) => [...prev, { ...message, content: text, isEncrypted: false }]);
         socketRef.current.emit('send_message', { ...message, sender: 'remote' });
@@ -454,7 +520,8 @@ export const usePeer = () => {
         },
         encryptionVersion?: 'v1' | 'v2',
         algorithm?: 'AES-CBC' | 'AES-GCM',
-    ): Promise<string> => {
+        resumeId?: string | null,
+    ): Promise<{ uploadId: string; nextChunkIndex: number }> => {
         const response = await fetch(`/upload/init/${roomId}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -468,6 +535,7 @@ export const usePeer = () => {
                 securityMode: encrypted ? 'encrypted' : 'plain',
                 encryptionVersion,
                 algorithm,
+                resumeId,
             }),
         });
 
@@ -476,7 +544,10 @@ export const usePeer = () => {
         }
 
         const data = await response.json();
-        return data.uploadId as string;
+        return {
+            uploadId: data.uploadId as string,
+            nextChunkIndex: (data.nextChunkIndex as number) || 0,
+        };
     };
 
     const completeUploadSession = async (roomId: string, uploadId: string) => {
@@ -616,17 +687,25 @@ export const usePeer = () => {
                     fileName: file.name,
                 };
 
-            uploadId = await createUploadSession(
+            const supportsResume = !encrypted || useFileCryptoV2;
+            const resumeId = supportsResume ? await generateResumeId(file) : null;
+
+            const sessionInitData = await createUploadSession(
                 targetRoomId,
                 file,
                 encrypted,
                 metadata,
                 encrypted ? (useFileCryptoV2 ? 'v2' : 'v1') : undefined,
                 encrypted ? (useFileCryptoV2 ? 'AES-GCM' : 'AES-CBC') : undefined,
+                resumeId,
             );
+            
+            uploadId = sessionInitData.uploadId;
+            const nextChunkIndex = sessionInitData.nextChunkIndex;
+            
             uploadSessionRef.current = { roomId: targetRoomId, uploadId };
 
-            let chunkIndex = 0;
+            let chunkIndex = nextChunkIndex;
             let uploadedPlainBytes = 0;
 
             if (encrypted) {
@@ -644,19 +723,25 @@ export const usePeer = () => {
                     throw new Error('Invalid encrypt worker init response');
                 }
 
-                await uploadChunkWithRetry(
-                    targetRoomId,
-                    uploadId,
-                    chunkIndex,
-                    headerResponse.chunk,
-                    uploadedPlainBytes,
-                    0,
-                    file.size,
-                );
-                chunkIndex += 1;
+                if (chunkIndex === 0) {
+                    await uploadChunkWithRetry(
+                        targetRoomId,
+                        uploadId,
+                        chunkIndex,
+                        headerResponse.chunk,
+                        uploadedPlainBytes,
+                        0,
+                        file.size,
+                    );
+                    chunkIndex += 1;
+                } else if (useFileCryptoV2) {
+                    uploadedPlainBytes = (chunkIndex - 1) * CHUNK_SIZE;
+                }
+            } else {
+                uploadedPlainBytes = chunkIndex * CHUNK_SIZE;
             }
 
-            for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
+            for (let offset = uploadedPlainBytes; offset < file.size; offset += CHUNK_SIZE) {
                 const end = Math.min(offset + CHUNK_SIZE, file.size);
                 const plainChunk = await file.slice(offset, end).arrayBuffer();
                 const plainChunkSize = end - offset;
@@ -751,11 +836,11 @@ export const usePeer = () => {
                 await abortUploadSession(session);
             }
 
-            setUploadProgress({ progress: 0, active: false, stage: 'idle' });
-
             if (message !== 'Upload aborted') {
                 console.error('Chunked upload failed:', error);
-                alert('File upload failed. Please try again.');
+                setUploadProgress({ progress: 0, active: true, stage: 'error', error: message });
+            } else {
+                setUploadProgress({ progress: 0, active: false, stage: 'idle' });
             }
         } finally {
             pendingRejectRef.current = null;
@@ -773,12 +858,14 @@ export const usePeer = () => {
 
     return {
         peerId,
+        refreshPeerId,
         roomPassword,
         hashedRoomId,
         encryptionKey,
         messages,
         files,
         onlineCount,
+        roomCapabilities,
         uploadProgress,
         joinRoom,
         leaveRoom,

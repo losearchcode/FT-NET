@@ -102,6 +102,9 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         resetState();
     } catch (error) {
         resetState();
-        workerScope.postMessage({ type: 'ERROR', error: getErrorMessage(error) });
+        const message = error instanceof DOMException && error.name === 'OperationError'
+            ? 'Data integrity check failed: the encrypted data may be corrupted or tampered with (GCM auth tag mismatch)'
+            : getErrorMessage(error);
+        workerScope.postMessage({ type: 'ERROR', error: message });
     }
 };

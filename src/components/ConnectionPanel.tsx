@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { DoorOpen, Globe, KeyRound, Users } from 'lucide-react';
+import type { RoomCapabilities } from '../types';
+import { DoorOpen, Globe, KeyRound, Users, RefreshCw } from 'lucide-react';
 
 interface RoomLoginPanelProps {
     peerId: string;
@@ -7,9 +8,12 @@ interface RoomLoginPanelProps {
     onlineCount: number;
     onJoin: (password: string) => void;
     onLeave: () => void;
+    onRefreshPeerId?: () => void;
+    roomCapabilities: RoomCapabilities;
+    supportsStreamSave: boolean;
 }
 
-export const ConnectionPanel: React.FC<RoomLoginPanelProps> = ({ peerId, roomPassword, onlineCount, onJoin, onLeave }) => {
+export const ConnectionPanel: React.FC<RoomLoginPanelProps> = ({ peerId, roomPassword, onlineCount, onJoin, onLeave, onRefreshPeerId, roomCapabilities, supportsStreamSave }) => {
     const [passwordInput, setPasswordInput] = useState('');
 
     const handleJoin = (e: React.FormEvent) => {
@@ -35,9 +39,30 @@ export const ConnectionPanel: React.FC<RoomLoginPanelProps> = ({ peerId, roomPas
                     textAlign: 'center',
                     fontWeight: 600,
                     fontSize: '1.1rem',
-                    letterSpacing: '1px'
+                    letterSpacing: '1px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '0.75rem',
                 }}>
-                    {peerId || '...'}
+                    <span>{peerId || '...'}</span>
+                    {onRefreshPeerId && (
+                        <button
+                            onClick={onRefreshPeerId}
+                            style={{
+                                background: 'transparent',
+                                border: 'none',
+                                padding: '4px',
+                                cursor: 'pointer',
+                                color: '#3b82f6',
+                                display: 'flex',
+                                alignItems: 'center',
+                            }}
+                            title="刷新身份标识"
+                        >
+                            <RefreshCw size={16} />
+                        </button>
+                    )}
                 </div>
             </div>
 
@@ -55,9 +80,60 @@ export const ConnectionPanel: React.FC<RoomLoginPanelProps> = ({ peerId, roomPas
                         <div style={{ fontFamily: 'monospace', fontSize: '1.5rem', marginBottom: '1rem', letterSpacing: '2px' }}>
                             {roomPassword}
                         </div>
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', marginBottom: '1.5rem', padding: '0.5rem 1rem', background: 'rgba(59, 130, 246, 0.1)', border: '1px solid rgba(59, 130, 246, 0.3)', borderRadius: '8px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', marginBottom: '1rem', padding: '0.5rem 1rem', background: 'rgba(59, 130, 246, 0.1)', border: '1px solid rgba(59, 130, 246, 0.3)', borderRadius: '8px' }}>
                             <Users size={16} color="#3b82f6" />
                             <span style={{ fontSize: '0.9rem', fontWeight: 600, color: '#3b82f6' }}>{onlineCount} 人在线</span>
+                        </div>
+
+                        {/* 安全状态摘要 */}
+                        <div style={{
+                            marginBottom: '1rem',
+                            padding: '0.65rem 0.8rem',
+                            background: 'rgba(15, 23, 42, 0.5)',
+                            borderRadius: '8px',
+                            border: '1px solid rgba(255,255,255,0.06)',
+                            fontSize: '0.75rem',
+                            lineHeight: '1.7',
+                        }}>
+                            <div style={{ fontWeight: 600, marginBottom: '0.4rem', color: '#94a3b8', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                                🔒 安全状态摘要
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                    <span style={{ color: '#94a3b8' }}>消息加密</span>
+                                    <span style={{ color: roomCapabilities.messageCryptoV2Enabled ? '#10b981' : '#f59e0b', fontWeight: 600 }}>
+                                        {roomCapabilities.messageCryptoV2Enabled ? 'AES-GCM v2' : 'AES-CBC v1'}
+                                    </span>
+                                </div>
+                                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                    <span style={{ color: '#94a3b8' }}>文件加密</span>
+                                    <span style={{ color: roomCapabilities.fileCryptoV2Enabled ? '#10b981' : '#f59e0b', fontWeight: 600 }}>
+                                        {roomCapabilities.fileCryptoV2Enabled ? 'AES-GCM v2' : 'AES-CBC v1'}
+                                    </span>
+                                </div>
+                                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                    <span style={{ color: '#94a3b8' }}>文件名保护</span>
+                                    <span style={{ color: roomCapabilities.fileCryptoV2Enabled ? '#10b981' : '#f59e0b', fontWeight: 600 }}>
+                                        {roomCapabilities.fileCryptoV2Enabled ? '已加密' : '明文'}
+                                    </span>
+                                </div>
+                                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                    <span style={{ color: '#94a3b8' }}>下载落盘</span>
+                                    <span style={{ color: supportsStreamSave ? '#10b981' : '#f59e0b', fontWeight: 600 }}>
+                                        {supportsStreamSave ? '流式保存' : '内存回退'}
+                                    </span>
+                                </div>
+                                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                    <span style={{ color: '#94a3b8' }}>密钥体系</span>
+                                    <span style={{ color: '#10b981', fontWeight: 600 }}>PBKDF2 + HKDF</span>
+                                </div>
+                                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                    <span style={{ color: '#94a3b8' }}>断点续传</span>
+                                    <span style={{ color: roomCapabilities.fileCryptoV2Enabled ? '#10b981' : '#f59e0b', fontWeight: 600 }}>
+                                        {roomCapabilities.fileCryptoV2Enabled ? '已启用' : '不支持 (V1)'}
+                                    </span>
+                                </div>
+                            </div>
                         </div>
                         <button onClick={onLeave} style={{ background: '#ef4444', border: '1px solid #7f1d1d' }}>
                             销毁并退出 <DoorOpen size={16} />

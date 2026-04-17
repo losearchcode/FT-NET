@@ -1,6 +1,7 @@
 import { startTransition, useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
 import { Upload, File as FileIcon, Download, Trash2, CheckSquare, Square, Eye, X, Info } from 'lucide-react';
-import type { FileMetadata } from '../types';
+import { ShieldCheck, ShieldAlert } from 'lucide-react';
+import type { FileMetadata, RoomCapabilities } from '../types';
 import DecryptWorker from '../workers/decryptWorker?worker';
 import DecryptWorkerV2 from '../workers/decryptWorkerV2?worker';
 import { isFileCryptoV2Available } from '../utils/fileCryptoV2';
@@ -12,11 +13,13 @@ interface FileTransferProps {
     uploadProgress: {
         progress: number;
         active: boolean;
-        stage: 'encrypting' | 'streaming' | 'idle';
+        stage: 'encrypting' | 'streaming' | 'idle' | 'error';
+        error?: string;
     };
     onUpload: (file: File, encrypted: boolean) => void;
     onCancelUpload: () => void;
     onDeleteFiles: (ids: string[]) => void;
+    roomCapabilities: RoomCapabilities;
 }
 
 type DecryptWorkerMessage =
@@ -28,7 +31,8 @@ type DownloadProgressState = {
     active: boolean;
     fileName: string;
     progress: number;
-    stage: 'downloading' | 'decrypting' | 'saving' | 'idle';
+    stage: 'downloading' | 'decrypting' | 'saving' | 'idle' | 'error';
+    error?: string;
 };
 
 const DOWNLOAD_PROGRESS_THROTTLE_MS = 80;
@@ -336,6 +340,7 @@ export const FileTransfer = ({
     onUpload,
     onCancelUpload,
     onDeleteFiles,
+    roomCapabilities,
 }: FileTransferProps) => {
     const [encryptUploads, setEncryptUploads] = useState(() => {
         const stored = localStorage.getItem('ft-net-encrypt-uploads');
@@ -349,6 +354,7 @@ export const FileTransfer = ({
     const [fileFilter, setFileFilter] = useState<'all' | 'encrypted' | 'plain'>('all');
     const [showStreamSaveHint, setShowStreamSaveHint] = useState(false);
     const [showUploadModeHint, setShowUploadModeHint] = useState(false);
+    const [showCryptoHint, setShowCryptoHint] = useState(false);
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [previewFile, setPreviewFile] = useState<FileMetadata | null>(null);
     const [textContent, setTextContent] = useState<string | null>(null);
@@ -524,7 +530,14 @@ export const FileTransfer = ({
         } catch (error) {
             if (previewRequestRef.current === requestId) {
                 console.error('解密预览失败:', error);
-                setTextContent('⚠️ 文件解密或加载失败');
+                const errorMessage = error instanceof Error ? error.message : '';
+                const isIntegrityError = errorMessage.includes('integrity')
+                    || errorMessage.includes('GCM auth tag');
+                setTextContent(
+                    isIntegrityError
+                        ? '⚠️ 文件完整性校验未通过：密文可能已损坏或被篡改'
+                        : '⚠️ 文件解密或加载失败',
+                );
             }
         } finally {
             if (previewRequestRef.current === requestId) {
@@ -648,16 +661,23 @@ export const FileTransfer = ({
                 });
             }, 600);
         } catch (error) {
-            updateDownloadProgress({
-                active: false,
-                fileName: '',
-                progress: 0,
-                stage: 'idle',
-            });
             if (isAbortError(error)) {
+                updateDownloadProgress({
+                    active: false,
+                    fileName: '',
+                    progress: 0,
+                    stage: 'idle',
+                });
                 return;
             }
-            alert('文件下载并解密失败');
+            console.error('Download failed:', error);
+            updateDownloadProgress({
+                active: true,
+                fileName: file.fileName,
+                progress: 0,
+                stage: 'error',
+                error: error instanceof Error ? error.message : String(error),
+            });
         }
     }, [fetchAndDecrypt, getDecryptWorkerCtor, roomId, roomPassword, supportsStreamSave, updateDownloadProgress]);
 
@@ -707,11 +727,122 @@ export const FileTransfer = ({
 
     return (
         <>
-            <div className="glass-panel animate-slide-up file-transfer-container">
+            <div
+                className="glass-panel animate-slide-up file-transfer-container"
+                style={{ position: 'relative', zIndex: 10 }}
+            >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '1rem', marginBottom: '1rem', flexWrap: 'wrap' }}>
                     <h2 style={{ fontSize: '1.25rem', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                         <FileIcon size={20} color="#8b5cf6" />
                         群组公共存储柜
+                        {roomCapabilities.fileCryptoV2Enabled ? (
+                            <div
+                                onMouseEnter={() => setShowCryptoHint(true)}
+                                onMouseLeave={() => setShowCryptoHint(false)}
+                                style={{
+                                    position: 'relative',
+                                    marginLeft: '0.5rem',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.3rem',
+                                    color: '#10b981',
+                                    fontSize: '0.7rem',
+                                    background: 'rgba(16, 185, 129, 0.1)',
+                                    padding: '0.2rem 0.6rem',
+                                    borderRadius: '1rem',
+                                    border: '1px solid rgba(16, 185, 129, 0.2)',
+                                    cursor: 'help'
+                                }}
+                            >
+                                <ShieldCheck size={13} /> E2EE Secured v2
+                                <Info size={11} style={{ marginLeft: '2px', opacity: 0.8 }} />
+
+                                {showCryptoHint && (
+                                    <div
+                                        style={{
+                                            position: 'absolute',
+                                            top: 'calc(100% + 8px)',
+                                            left: 0,
+                                            zIndex: 999,
+                                            width: '280px',
+                                            padding: '0.8rem 0.9rem',
+                                            borderRadius: '12px',
+                                            background: 'rgba(15, 23, 42, 0.96)',
+                                            border: '1px solid rgba(16, 185, 129, 0.3)',
+                                            boxShadow: '0 18px 40px rgba(0, 0, 0, 0.32)',
+                                            backdropFilter: 'blur(10px)',
+                                            pointerEvents: 'none',
+                                            color: '#cbd5e1',
+                                            fontWeight: 'normal',
+                                            lineHeight: '1.6',
+                                            whiteSpace: 'normal',
+                                            textTransform: 'none'
+                                        }}
+                                    >
+                                        <div style={{ fontSize: '0.82rem', fontWeight: 600, color: '#10b981', marginBottom: '0.45rem' }}>
+                                            V2 旗舰加密架构
+                                        </div>
+                                        <div style={{ fontSize: '0.75rem' }}>
+                                            当前已全面支持最高级 V2 加密标准（基于 AES-GCM 独立分块验证）。该模式下支持文件极速指纹认证及无缝抗断网大文件断点续传。
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                            <div
+                                onMouseEnter={() => setShowCryptoHint(true)}
+                                onMouseLeave={() => setShowCryptoHint(false)}
+                                style={{
+                                    position: 'relative',
+                                    marginLeft: '0.5rem',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.3rem',
+                                    color: '#f59e0b',
+                                    fontSize: '0.7rem',
+                                    background: 'rgba(245, 158, 11, 0.1)',
+                                    padding: '0.2rem 0.6rem',
+                                    borderRadius: '1rem',
+                                    border: '1px solid rgba(245, 158, 11, 0.2)',
+                                    cursor: 'help'
+                                }}
+                            >
+                                <ShieldAlert size={13} /> E2EE Secured v1
+                                <Info size={11} style={{ marginLeft: '2px', opacity: 0.8 }} />
+
+                                {showCryptoHint && (
+                                    <div
+                                        style={{
+                                            position: 'absolute',
+                                            top: 'calc(100% + 8px)',
+                                            left: 0,
+                                            zIndex: 999,
+                                            width: '280px',
+                                            padding: '0.8rem 0.9rem',
+                                            borderRadius: '12px',
+                                            background: 'rgba(15, 23, 42, 0.96)',
+                                            border: '1px solid rgba(245, 158, 11, 0.3)',
+                                            boxShadow: '0 18px 40px rgba(0, 0, 0, 0.32)',
+                                            backdropFilter: 'blur(10px)',
+                                            pointerEvents: 'none',
+                                            color: '#cbd5e1',
+                                            fontWeight: 'normal',
+                                            lineHeight: '1.6',
+                                            whiteSpace: 'normal',
+                                            textTransform: 'none'
+                                        }}
+                                    >
+                                        <div style={{ fontSize: '0.82rem', fontWeight: 600, color: '#fcd34d', marginBottom: '0.45rem' }}>
+                                            V1 降级兼容模式
+                                        </div>
+                                        <div style={{ fontSize: '0.75rem' }}>
+                                            由于所处的网络环境不受信（缺少 HTTPS 或 localhost），架构已降级至老版本 V1 模式保护数据。<br /><br />
+                                            ⚠️ <strong style={{ color: '#fbbf24' }}>注意：</strong>V1 采用的是 AES-CBC 连续流式加密，由于其拥有严苛的状态上下文强依赖特征，因此在此模式下暂不支持大文件意外中断的断点续传。
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        )}
                     </h2>
 
                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap', marginLeft: 'auto' }}>
@@ -837,15 +968,23 @@ export const FileTransfer = ({
                 </div>
 
                 {uploadProgress.active && (
-                    <div style={{ marginBottom: '1rem', background: 'rgba(139, 92, 246, 0.05)', padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(139, 92, 246, 0.2)' }}>
+                    <div style={{
+                        marginBottom: '1rem',
+                        background: uploadProgress.stage === 'error' ? 'rgba(239, 68, 68, 0.08)' : 'rgba(139, 92, 246, 0.05)',
+                        padding: '0.75rem',
+                        borderRadius: '8px',
+                        border: uploadProgress.stage === 'error' ? '1px solid rgba(239, 68, 68, 0.3)' : '1px solid rgba(139, 92, 246, 0.2)'
+                    }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem', fontSize: '0.85rem' }}>
-                            <span style={{ color: '#a78bfa', fontWeight: 500 }}>
-                                {uploadProgress.stage === 'encrypting'
+                            <span style={{ color: uploadProgress.stage === 'error' ? '#f87171' : '#a78bfa', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                {uploadProgress.stage === 'error'
+                                    ? `🔴 上传意外中断: ${uploadProgress.error || '未知网络或内存错误'}`
+                                    : uploadProgress.stage === 'encrypting'
                                     ? '🔒 正在准备加密通道...'
                                     : '🔒☁️ 正在安全加密并上传...'}
                             </span>
-                            <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-                                <span>{Math.round(uploadProgress.progress * 100)}%</span>
+                            <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexShrink: 0 }}>
+                                {uploadProgress.stage !== 'error' && <span>{Math.round(uploadProgress.progress * 100)}%</span>}
                                 <button
                                     onClick={onCancelUpload}
                                     style={{
@@ -858,31 +997,61 @@ export const FileTransfer = ({
                                         cursor: 'pointer',
                                     }}
                                 >
-                                    取消
+                                    {uploadProgress.stage === 'error' ? '关闭' : '取消'}
                                 </button>
                             </div>
                         </div>
-                        <div className="progress-bar-bg" style={{ background: 'rgba(255,255,255,0.1)', height: '6px', borderRadius: '3px' }}>
-                            <div className="progress-bar-fill" style={{ height: '100%', width: `${uploadProgress.progress * 100}%`, background: '#8b5cf6', borderRadius: '3px', transition: 'width 0.2s' }} />
-                        </div>
+                        {uploadProgress.stage !== 'error' && (
+                            <div className="progress-bar-bg" style={{ background: 'rgba(255,255,255,0.1)', height: '6px', borderRadius: '3px' }}>
+                                <div className="progress-bar-fill" style={{ height: '100%', width: `${uploadProgress.progress * 100}%`, background: '#8b5cf6', borderRadius: '3px', transition: 'width 0.2s' }} />
+                            </div>
+                        )}
                     </div>
                 )}
 
-                        {downloadProgress.active && (
-                    <div style={{ marginBottom: '1rem', background: 'rgba(59, 130, 246, 0.06)', padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(59, 130, 246, 0.22)' }}>
+                {downloadProgress.active && (
+                    <div style={{
+                        marginBottom: '1rem',
+                        background: downloadProgress.stage === 'error' ? 'rgba(239, 68, 68, 0.08)' : 'rgba(59, 130, 246, 0.06)',
+                        padding: '0.75rem',
+                        borderRadius: '8px',
+                        border: downloadProgress.stage === 'error' ? '1px solid rgba(239, 68, 68, 0.3)' : '1px solid rgba(59, 130, 246, 0.22)'
+                    }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem', fontSize: '0.85rem', gap: '0.75rem' }}>
-                            <span style={{ color: '#93c5fd', fontWeight: 500, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>
-                                {downloadProgress.stage === 'saving'
+                            <span style={{ color: downloadProgress.stage === 'error' ? '#f87171' : '#93c5fd', fontWeight: 500, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>
+                                {downloadProgress.stage === 'error'
+                                    ? `🔴 解密或下载中断: ${downloadProgress.error || '不明失败'}`
+                                    : downloadProgress.stage === 'saving'
                                     ? `💾 正在写入本地文件 ${downloadProgress.fileName}...`
                                     : downloadProgress.stage === 'decrypting'
                                     ? `🔓 正在收尾解密 ${downloadProgress.fileName}...`
                                     : `📥 正在下载并解密 ${downloadProgress.fileName}...`}
                             </span>
-                            <span>{Math.round(downloadProgress.progress * 100)}%</span>
+                            <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexShrink: 0 }}>
+                                {downloadProgress.stage !== 'error' && <span>{Math.round(downloadProgress.progress * 100)}%</span>}
+                                {downloadProgress.stage === 'error' && (
+                                    <button
+                                        onClick={() => updateDownloadProgress({ active: false, fileName: '', progress: 0, stage: 'idle' })}
+                                        style={{
+                                            padding: '2px 8px',
+                                            fontSize: '0.7rem',
+                                            background: 'rgba(239, 68, 68, 0.1)',
+                                            color: '#ef4444',
+                                            border: '1px solid rgba(239, 68, 68, 0.2)',
+                                            borderRadius: '4px',
+                                            cursor: 'pointer',
+                                        }}
+                                    >
+                                        关闭
+                                    </button>
+                                )}
+                            </div>
                         </div>
-                        <div className="progress-bar-bg" style={{ background: 'rgba(255,255,255,0.1)', height: '6px', borderRadius: '3px' }}>
-                            <div className="progress-bar-fill" style={{ height: '100%', width: `${downloadProgress.progress * 100}%`, background: '#3b82f6', borderRadius: '3px', transition: 'width 0.2s' }} />
-                        </div>
+                        {downloadProgress.stage !== 'error' && (
+                            <div className="progress-bar-bg" style={{ background: 'rgba(255,255,255,0.1)', height: '6px', borderRadius: '3px' }}>
+                                <div className="progress-bar-fill" style={{ height: '100%', width: `${downloadProgress.progress * 100}%`, background: '#3b82f6', borderRadius: '3px', transition: 'width 0.2s' }} />
+                            </div>
+                        )}
                     </div>
                 )}
 
@@ -890,7 +1059,7 @@ export const FileTransfer = ({
                     <div style={{ marginBottom: '1rem', background: 'rgba(245, 158, 11, 0.08)', padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(245, 158, 11, 0.24)', display: 'flex', alignItems: 'flex-start', gap: '0.5rem' }}>
                         <Info size={16} color="#f59e0b" style={{ flexShrink: 0, marginTop: '2px' }} />
                         <div style={{ fontSize: '0.8rem', lineHeight: '1.5', color: '#fcd34d' }}>
-                            当前浏览器不支持流式保存。下载加密文件时会先在浏览器内存中完成下载和解密，因此会占用电脑运行内存。
+                            【内存回退模式】当前浏览器环境不支持原生流式存盘。下载大型加密文件时必须全盘加载解密，<strong>将会强制占用与文件本体等同规格甚至双倍的电脑运行内存（RAM）</strong>，极大增加浏览器卡顿或由于爆显存而崩溃的风险。请谨慎下载超大文件。
                         </div>
                     </div>
                 )}
@@ -947,7 +1116,7 @@ export const FileTransfer = ({
                                     <div
                                         style={{
                                             position: 'absolute',
-                                            bottom: 'calc(100% + 10px)',
+                                            top: 'calc(100% + 10px)',
                                             left: '-8px',
                                             zIndex: 999,
                                             width: '320px',
@@ -972,13 +1141,15 @@ export const FileTransfer = ({
                                             </>
                                         ) : (
                                             <>
-                                                <div style={{ fontSize: '0.82rem', fontWeight: 600, color: '#ddd6fe', marginBottom: '0.45rem' }}>
+                                                <div style={{ fontSize: '0.82rem', fontWeight: 600, color: '#fcd34d', marginBottom: '0.45rem' }}>
                                                     内存回退模式说明
                                                 </div>
                                                 <ul style={{ margin: 0, paddingLeft: '1.1rem', fontSize: '0.77rem', lineHeight: '1.6', color: '#cbd5e1' }}>
-                                                    <li>当前访问环境未启用流式保存能力，下载加密文件时会先在浏览器内存中完成下载与解密。</li>
-                                                    <li>如需切换到流式保存，建议使用较新的浏览器，并通过 HTTPS 或 localhost 访问系统。</li>
-                                                    <li>局域网 HTTP 地址通常会被浏览器判定为不安全上下文，因此无法启用流式保存能力。</li>
+                                                    <li>当前访问环境未启用流式下沉保存 API，下载加密文件时只能在浏览器内构建并驻留虚拟 Blob 闭环。</li>
+                                                    <li style={{ color: '#fbbf24', marginTop: '0.3rem', listStyleType: 'square' }}>
+                                                        <strong style={{ fontWeight: 800 }}>⚠️ 严重性能降级警告：</strong>当下载体积巨大的加密电影等大文件时，该模式<strong>将会强行抽走与文件等量的电脑硬件运行内存（RAM）</strong>，从而极大概率因爆满导致当前浏览器崩溃白屏甚至电脑死机！
+                                                    </li>
+                                                    <li style={{ marginTop: '0.3rem' }}>如需解锁真正的流式存盘，强制建议挂载 HTTPS 证书域<strong>和</strong>切换使用高版本的 Chrome 浏览器测试。</li>
                                                 </ul>
                                             </>
                                         )}

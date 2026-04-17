@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
-import { Info, MessageSquare, Send } from 'lucide-react';
-import type { P2PMessage, TextMessage } from '../types';
+import { Info, MessageSquare, Send, ShieldCheck, ShieldAlert } from 'lucide-react';
+import type { P2PMessage, TextMessage, RoomCapabilities } from '../types';
 
 interface ChatBoxProps {
     messages: P2PMessage[];
     onSendMessage: (msg: string) => void | Promise<void>;
     myId: string;
+    roomCapabilities: RoomCapabilities;
 }
 
-export const ChatBox: React.FC<ChatBoxProps> = ({ messages, onSendMessage, myId }) => {
+export const ChatBox: React.FC<ChatBoxProps> = ({ messages, onSendMessage, myId, roomCapabilities }) => {
     const [input, setInput] = useState('');
     const messagesAreaRef = useRef<HTMLDivElement>(null);
 
@@ -34,10 +35,21 @@ export const ChatBox: React.FC<ChatBoxProps> = ({ messages, onSendMessage, myId 
 
     return (
         <div className="glass-panel animate-slide-up chat-container" style={{ animationDelay: '0.3s' }}>
-            <h2 style={{ fontSize: '1.25rem', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <MessageSquare size={20} color="#f43f5e" />
-                群组通讯录
-            </h2>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                <h2 style={{ fontSize: '1.25rem', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <MessageSquare size={20} color="#f43f5e" />
+                    群组通讯录
+                </h2>
+                {roomCapabilities.messageCryptoV2Enabled ? (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: '#10b981', fontSize: '0.75rem', background: 'rgba(16, 185, 129, 0.1)', padding: '0.3rem 0.6rem', borderRadius: '1rem', border: '1px solid rgba(16, 185, 129, 0.2)' }} title="房间成员均支持最高级别的 V2 端到端加密机制">
+                        <ShieldCheck size={14} /> E2EE Secured v2
+                    </div>
+                ) : (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: '#f59e0b', fontSize: '0.75rem', background: 'rgba(245, 158, 11, 0.1)', padding: '0.3rem 0.6rem', borderRadius: '1rem', border: '1px solid rgba(245, 158, 11, 0.2)' }} title="部分成员客户端版本过低，已降级为兼容加密模式">
+                        <ShieldAlert size={14} /> E2EE Secured v1
+                    </div>
+                )}
+            </div>
 
             <div className="messages-area" ref={messagesAreaRef}>
                 {messages.length === 0 ? (
